@@ -407,6 +407,93 @@ def _read_cids(sum_db):
         return set()
 
 
+def prune_ghost_sessions(cli_dir, app_dir, project=None):
+    """
+    Safely prune ghost/mirrored session entries from Antigravity CLI's conversation_summaries.db.
+    Triggered when opening a project to eliminate Desktop mirrors and ghost entries.
+
+    Solid safety conditions (ALL must be met before deleting any row):
+      1. Physical file check: The trajectory file DOES NOT exist in CLI:
+         NOT os.path.exists(cli_dir/conversations/{cid}.db)
+         -> If the CLI file exists, it is NEVER deleted under any circumstances.
+      2. App data dir check: Explicitly tagged as Desktop-owned in CLI table:
+         app_data_dir == 'antigravity'
+         -> Legitimate CLI sessions have app_data_dir == 'antigravity-cli' or ''.
+      3. Absence of genuine CLI payload or exists in Desktop:
+         raw_summary IS NULL OR LENGTH(raw_summary) == 0 OR os.path.exists(app_dir/conversations/{cid}.db)
+         -> Proves this row is either an empty summary mirror or exists as an active Desktop session.
+      4. Project scoping (if project provided):
+         The session matches the opened project via is_session_for_project(s, project).
+
+    Returns the number of pruned rows.
+    """
+    sum_db = os.path.join(cli_dir, 'conversation_summaries.db')
+    if not os.path.exists(sum_db):
+        return 0
+
+    try:
+        con = sqlite3.connect(sum_db)
+        cur = con.cursor()
+        cols = [c[1] for c in cur.execute('PRAGMA table_info(conversation_summaries)').fetchall()]
+        if not cols or 'conversation_id' not in cols or 'app_data_dir' not in cols:
+            con.close()
+            return 0
+
+        rows = cur.execute('SELECT * FROM conversation_summaries').fetchall()
+        ghost_cids = []
+
+        cli_conv_dir = os.path.join(cli_dir, 'conversations')
+        desk_conv_dir = os.path.join(app_dir, 'conversations')
+
+        for r in rows:
+            d = dict(zip(cols, r))
+            cid = d.get('conversation_id')
+            if not cid:
+                continue
+
+            # 4. Project scoping (if project provided)
+            if project and not is_session_for_project(d, project):
+                continue
+
+            # 1. Trajectory file DOES NOT exist in CLI
+            cli_db = os.path.join(cli_conv_dir, f'{cid}.db')
+            if os.path.exists(cli_db):
+                continue
+
+            # 2. Explicitly tagged as Desktop-owned in CLI table
+            app_dir_tag = d.get('app_data_dir') or ''
+            if app_dir_tag != 'antigravity':
+                continue
+
+            # 3. Absence of genuine CLI payload or exists in Desktop
+            raw = d.get('raw_summary')
+            raw_len = len(raw) if raw else 0
+            desk_db = os.path.join(desk_conv_dir, f'{cid}.db')
+            has_desk_file = os.path.exists(desk_db)
+
+            if raw_len == 0 or has_desk_file:
+                ghost_cids.append(cid)
+
+        if not ghost_cids:
+            con.close()
+            return 0
+
+        # Execute safe deletion in batches
+        placeholders = ','.join(['?'] * len(ghost_cids))
+        cur.execute(f'DELETE FROM conversation_summaries WHERE conversation_id IN ({placeholders})', ghost_cids)
+
+        try:
+            cur.execute(f'DELETE FROM conversations_fts WHERE conversation_id IN ({placeholders})', ghost_cids)
+        except Exception:
+            pass
+
+        con.commit()
+        con.close()
+        return len(ghost_cids)
+    except Exception:
+        return 0
+
+
 def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP):
     """Load all valid root sessions from src_dir, grouping subagents under root parents."""
     sum_db = os.path.join(src_dir, 'conversation_summaries.db')
@@ -449,6 +536,8 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
         if parent_id:
             subagents_by_parent.setdefault(parent_id, []).append(s)
 
+    conv_dir = os.path.join(src_dir, 'conversations')
+
     # Filter to root sessions and discard ghost uninitialized sessions
     root_sessions = []
     for s in all_sessions:
@@ -466,6 +555,12 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
                 continue
             # Skip CLI-watcher mirrors inside the Desktop store
             if (s.get('source') or '') == CLI_SOURCE_NAME:
+                continue
+
+            # Exclude ghost sessions: if conversations dir exists, file must be present; skip desktop mirrors
+            if os.path.isdir(conv_dir) and not os.path.exists(os.path.join(conv_dir, f'{cid}.db')):
+                continue
+            if (s.get('app_data_dir') or '') == 'antigravity':
                 continue
 
             # Determine migration status (check deterministic mapped cid or native cid in dst_dir/conversations)
@@ -1643,6 +1738,10 @@ def run_migration():
                 sys.exit(0)
 
             target_project = proj_res
+
+            # Automatically prune ghost/mirrored sessions for the opened project
+            prune_ghost_sessions(cli_dir, app_dir, target_project)
+
             step = 2
             continue
 
