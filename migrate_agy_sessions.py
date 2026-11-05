@@ -28,6 +28,7 @@ import socket
 import shutil
 import sqlite3
 import argparse
+import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -62,9 +63,254 @@ def map_cid(cid, direction=TO_DESKTOP):
     return get_desktop_cid(cid)
 
 
+def direction_label(direction=TO_DESKTOP):
+    return 'Antigravity CLI -> Antigravity Desktop'
+
+
 # ---------------------------------------------------------------------------
-# Cross-Platform Terminal & Keypress Handling
+# Platform Profile & Cross-Platform Abstraction
 # ---------------------------------------------------------------------------
+
+UNIX_ESCAPE_SEQUENCES = {
+    '[A': 'UP',
+    '[B': 'DOWN',
+    '[C': 'RIGHT',
+    '[D': 'LEFT',
+    '[H': 'HOME',
+    'OH': 'HOME',
+    '[1~': 'HOME',
+    '[7~': 'HOME',
+    '[F': 'END',
+    'OF': 'END',
+    '[4~': 'END',
+    '[8~': 'END',
+    '[5~': 'PAGE_UP',
+    '[6~': 'PAGE_DOWN',
+}
+
+
+def _win_enable_ansi():
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        h_out = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(h_out, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+def _posix_enable_ansi():
+    pass
+
+
+def _win_get_key():
+    import msvcrt
+    ch = msvcrt.getch()
+    if ch in (b'\x00', b'\xe0'):
+        ch2 = msvcrt.getch()
+        scan_map = {
+            b'H': 'UP', b'P': 'DOWN', b'K': 'LEFT', b'M': 'RIGHT',
+            b'G': 'HOME', b'O': 'END', b'I': 'PAGE_UP', b'Q': 'PAGE_DOWN',
+        }
+        return scan_map.get(ch2, 'SPECIAL')
+    if ch in (b'\r', b'\n'):
+        return 'ENTER'
+    if ch == b' ':
+        return 'SPACE'
+    if ch == b'\x1b':
+        return 'ESC'
+    if ch == b'\t':
+        return 'TAB'
+    if ch in (b'\x03', b'\x1a'):
+        return 'CTRL_C'
+    try:
+        return ch.decode('latin1').lower()
+    except Exception:
+        return ''
+
+
+def _posix_get_key():
+    if not sys.stdin.isatty():
+        try:
+            line = sys.stdin.readline()
+            return line.strip().lower() if line else 'QUIT'
+        except Exception:
+            return 'QUIT'
+
+    try:
+        import tty
+        import termios
+        import select
+    except ImportError:
+        return 'QUIT'
+
+    try:
+        fd = sys.stdin.fileno()
+    except Exception:
+        return 'QUIT'
+
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            seq = ''
+            while True:
+                r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not r:
+                    break
+                seq += sys.stdin.read(1)
+                if seq in UNIX_ESCAPE_SEQUENCES:
+                    return UNIX_ESCAPE_SEQUENCES[seq]
+                if len(seq) >= 5:
+                    break
+            return 'ESC'
+        if ch in ('\r', '\n'):
+            return 'ENTER'
+        if ch == ' ':
+            return 'SPACE'
+        if ch == '\t':
+            return 'TAB'
+        if ch == '\x03':
+            return 'CTRL_C'
+        return ch.lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _win_is_pid_running(pid):
+    if not pid or pid <= 0:
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        h_proc = kernel32.OpenProcess(0x1000, False, pid)
+        if not h_proc:
+            return False
+        exit_code = ctypes.c_ulong()
+        if kernel32.GetExitCodeProcess(h_proc, ctypes.byref(exit_code)):
+            kernel32.CloseHandle(h_proc)
+            return exit_code.value == 259
+        kernel32.CloseHandle(h_proc)
+        return False
+    except Exception:
+        return False
+
+
+def _posix_is_pid_running(pid):
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
+def _win_get_process_name(pid):
+    if not pid or pid <= 0:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        h_proc = kernel32.OpenProcess(0x1000, False, pid)
+        if not h_proc:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(512)
+            size = wintypes.DWORD(512)
+            if kernel32.QueryFullProcessImageNameW(
+                    h_proc, 0, buf, ctypes.byref(size)):
+                return buf.value
+        finally:
+            kernel32.CloseHandle(h_proc)
+    except Exception:
+        pass
+    return ""
+
+
+def _linux_get_process_name(pid):
+    if not pid or pid <= 0:
+        return ""
+    comm_file = f"/proc/{pid}/comm"
+    if os.path.exists(comm_file):
+        try:
+            with open(comm_file, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    exe_file = f"/proc/{pid}/exe"
+    if os.path.exists(exe_file):
+        try:
+            return os.readlink(exe_file)
+        except Exception:
+            pass
+    return ""
+
+
+def _macos_get_process_name(pid):
+    if not pid or pid <= 0:
+        return ""
+    try:
+        res = subprocess.run(
+            ['ps', '-p', str(pid), '-o', 'comm='],
+            capture_output=True,
+            text=True,
+            timeout=0.5
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+class PlatformProfile:
+    """Encapsulates all platform-varying capabilities into a single profile."""
+
+    def __init__(self, plat_name=None):
+        self.plat_name = plat_name or sys.platform
+        self.is_windows = self.plat_name == 'win32'
+        self.is_macos = self.plat_name == 'darwin'
+        self.is_linux = self.plat_name.startswith('linux')
+
+        # Windows and macOS default filesystems are case-insensitive;
+        # Linux is case-sensitive
+        self.case_sensitive_paths = self.is_linux
+
+        # Known CLI binary names to distinguish CLI daemon from
+        # Desktop Language Server
+        if self.is_windows:
+            self.cli_process_names = {'agy.exe', 'agy'}
+        else:
+            self.cli_process_names = {'agy', 'agy.exe'}
+
+        # Bind platform-specific function handlers
+        if self.is_windows:
+            self.read_key = _win_get_key
+            self.is_pid_running = _win_is_pid_running
+            self.get_process_name = _win_get_process_name
+            self.enable_ansi = _win_enable_ansi
+        elif self.is_macos:
+            self.read_key = _posix_get_key
+            self.is_pid_running = _posix_is_pid_running
+            self.get_process_name = _macos_get_process_name
+            self.enable_ansi = _posix_enable_ansi
+        else:
+            self.read_key = _posix_get_key
+            self.is_pid_running = _posix_is_pid_running
+            self.get_process_name = _linux_get_process_name
+            self.enable_ansi = _posix_enable_ansi
+
+
+PLATFORM = PlatformProfile()
 
 
 def init_terminal():
@@ -79,17 +325,7 @@ def init_terminal():
             sys.stderr.reconfigure(encoding='utf-8', errors='replace')
         except Exception:
             pass
-
-    if os.name == 'nt':
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            h_out = kernel32.GetStdHandle(-11)
-            mode = ctypes.c_ulong()
-            if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(h_out, mode.value | 0x0004)
-        except Exception:
-            pass
+    PLATFORM.enable_ansi()
 
 
 def hide_cursor():
@@ -117,84 +353,7 @@ def get_terminal_size():
 
 def get_key():
     """Wait for a single keypress cross-platform and return a normalized string."""
-    if os.name == 'nt':
-        import msvcrt
-        ch = msvcrt.getch()
-        if ch in (b'\x00', b'\xe0'):
-            ch2 = msvcrt.getch()
-            if ch2 == b'H':
-                return 'UP'
-            if ch2 == b'P':
-                return 'DOWN'
-            if ch2 == b'K':
-                return 'LEFT'
-            if ch2 == b'M':
-                return 'RIGHT'
-            if ch2 == b'G':
-                return 'HOME'
-            if ch2 == b'O':
-                return 'END'
-            if ch2 == b'I':
-                return 'PAGE_UP'
-            if ch2 == b'Q':
-                return 'PAGE_DOWN'
-            return 'SPECIAL'
-        if ch in (b'\r', b'\n'):
-            return 'ENTER'
-        if ch == b' ':
-            return 'SPACE'
-        if ch == b'\x1b':
-            return 'ESC'
-        if ch == b'\t':
-            return 'TAB'
-        if ch in (b'\x03', b'\x1a'):
-            return 'CTRL_C'
-        try:
-            return ch.decode('latin1').lower()
-        except Exception:
-            return ''
-    else:
-        import tty
-        import termios
-        import select
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if ch == '\x1b':
-                r, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if r:
-                    ch2 = sys.stdin.read(1)
-                    if ch2 == '[':
-                        ch3 = sys.stdin.read(1)
-                        if ch3 == 'A':
-                            return 'UP'
-                        if ch3 == 'B':
-                            return 'DOWN'
-                        if ch3 == 'C':
-                            return 'RIGHT'
-                        if ch3 == 'D':
-                            return 'LEFT'
-                        if ch3 == 'H':
-                            return 'HOME'
-                        if ch3 == 'F':
-                            return 'END'
-                        if ch3 in ('5', '6'):
-                            sys.stdin.read(1)  # consume ~
-                            return 'PAGE_UP' if ch3 == '5' else 'PAGE_DOWN'
-                return 'ESC'
-            if ch in ('\r', '\n'):
-                return 'ENTER'
-            if ch == ' ':
-                return 'SPACE'
-            if ch == '\t':
-                return 'TAB'
-            if ch == '\x03':
-                return 'CTRL_C'
-            return ch.lower()
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return PLATFORM.read_key()
 
 # ---------------------------------------------------------------------------
 # Protobuf Varint & Wire Helpers (Zero External Dependencies)
@@ -286,14 +445,33 @@ def serialize_fields(fields):
 # ---------------------------------------------------------------------------
 
 
+def file_uri_to_path(uri):
+    """
+    Convert a file URI (file:///...) or file path to a clean native filesystem path.
+    Preserves leading slash on POSIX (/home/...) while handling Windows drive letters (C:/...).
+    """
+    if not uri:
+        return ''
+    p = urllib.parse.unquote(uri)
+    if p.startswith('file:///'):
+        rest = p[7:]
+        if len(rest) > 2 and rest[0] == '/' and rest[2] == ':':
+            rest = rest[1:]
+        return rest
+    elif p.startswith('file://'):
+        return p[7:]
+    return p
+
+
 def normalize_path(p):
     """Normalize file path for cross-platform comparisons."""
     if not p:
         return ''
-    p = urllib.parse.unquote(p)
-    if p.startswith('file:///'):
-        p = p[8:]
-    return p.replace('\\', '/').rstrip('/').lower()
+    p = file_uri_to_path(p)
+    p = p.replace('\\', '/').rstrip('/')
+    if not PLATFORM.case_sensitive_paths:
+        p = p.lower()
+    return p
 
 
 def is_session_for_project(session, project):
@@ -360,12 +538,10 @@ def discover_projects(config_dir):
                     folder_uri = resources[0]['gitFolder'].get('folderUri', '')
                 readable_path = ''
                 if folder_uri:
-                    clean_uri = urllib.parse.unquote(folder_uri)
-                    if clean_uri.startswith('file:///'):
-                        readable_path = clean_uri[8:]
-                        if len(readable_path) > 2 and readable_path[1] == ':':
-                            readable_path = readable_path[0].upper(
-                            ) + readable_path[1:]
+                    clean_path = file_uri_to_path(folder_uri)
+                    if len(clean_path) > 2 and clean_path[1] == ':':
+                        clean_path = clean_path[0].upper() + clean_path[1:]
+                    readable_path = clean_path
                 projects.append({
                     'id': pid,
                     'name': name,
@@ -641,31 +817,7 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
 
 def is_pid_running(pid):
     """Fast check whether a process ID is currently alive cross-platform."""
-    if not pid or pid <= 0:
-        return False
-    if os.name == 'nt':
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h_proc = kernel32.OpenProcess(0x1000, False, pid)
-            if not h_proc:
-                return False
-            exit_code = ctypes.c_ulong()
-            # STILL_ACTIVE = 259
-            if kernel32.GetExitCodeProcess(h_proc, ctypes.byref(exit_code)):
-                kernel32.CloseHandle(h_proc)
-                return exit_code.value == 259
-            kernel32.CloseHandle(h_proc)
-            return False
-        except Exception:
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+    return PLATFORM.is_pid_running(pid)
 
 
 def is_port_listening(port, timeout=0.05):
@@ -681,35 +833,7 @@ def is_port_listening(port, timeout=0.05):
 
 def get_process_name(pid):
     """Cross-platform process name lookup for a given PID."""
-    if not pid or pid <= 0:
-        return ""
-    if os.name == 'nt':
-        try:
-            import ctypes
-            from ctypes import wintypes
-            kernel32 = ctypes.windll.kernel32
-            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h_proc = kernel32.OpenProcess(0x1000, False, pid)
-            if not h_proc:
-                return ""
-            try:
-                buf = ctypes.create_unicode_buffer(512)
-                size = wintypes.DWORD(512)
-                if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
-                    return buf.value.lower()
-            finally:
-                kernel32.CloseHandle(h_proc)
-        except Exception:
-            return ""
-    elif os.name == 'posix':
-        try:
-            comm = f"/proc/{pid}/comm"
-            if os.path.exists(comm):
-                with open(comm, 'r', encoding='utf-8') as f:
-                    return f.read().strip().lower()
-        except Exception:
-            pass
-    return ""
+    return PLATFORM.get_process_name(pid)
 
 
 def detect_live_hub(app_dir):
@@ -746,7 +870,8 @@ def detect_live_hub(app_dir):
 
             # 2. Process check: ignore CLI ('agy') hubs
             proc_path = get_process_name(pid)
-            if proc_path.endswith('agy.exe') or proc_path.endswith('/agy'):
+            proc_base = os.path.basename(proc_path).lower()
+            if proc_base in PLATFORM.cli_process_names:
                 continue
 
             # 3. Fast TCP port probe (instant ~0ms): skip closed ports
@@ -1729,9 +1854,9 @@ def run_migration():
 
     # Initial cursor positions
     current_project_idx = 1
-    cwd = os.getcwd().replace('\\', '/').lower()
+    norm_cwd = normalize_path(os.getcwd())
     for idx, p in enumerate(projects):
-        if p['readablePath'] and p['readablePath'].lower().replace('\\', '/') == cwd:
+        if p['readablePath'] and normalize_path(p['readablePath']) == norm_cwd:
             current_project_idx = idx + 1
             break
 
