@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-Antigravity Session Migrator: CLI <-> Desktop
+Antigravity Session Migrator: CLI -> Desktop
 =============================================
-A universal, zero-dependency interactive tool to migrate conversation sessions between
-Antigravity CLI (`agy`) and Antigravity Desktop, in either direction.
+A universal, zero-dependency interactive tool to migrate conversation sessions from
+Antigravity CLI (`agy`) into Antigravity Desktop.
 
 Features:
 - Pure Python 3 standard library (zero external dependencies).
 - Cross-platform interactive TUI (Windows msvcrt / Unix termios).
-- Startup check: both Antigravity CLI and Antigravity Desktop must be installed.
-- Step 1: pick the migration source (Antigravity CLI or Antigravity Desktop).
-- Step 2: pick the project to browse.
-- Step 3: pick sessions (Space to toggle, 'a' all, 'f' project filter, Enter/c to migrate).
+- Startup check: Antigravity Desktop must be running. If not, prompts user to start it
+  with [Enter] to retry or [Esc/q] to quit.
+- Step 1: pick the target project.
+- Step 2: pick sessions (Space to toggle, 'a' all, 'f' project filter, Enter/c to migrate).
 - Uniform navigation: [Esc] or the "< Back" button returns to the previous step; on Step 1 it exits.
-- Automatic filtering of corrupt/ghost uninitialized sessions and of sessions that were
-  themselves migrated from the other side (prevents ping-pong copies).
+- Automatic filtering of corrupt/ghost uninitialized sessions.
 - Automatic bundling of child subagent trajectories with their parent sessions.
-- Desktop target: Live RPC when Antigravity Desktop is running, or direct SQLite/Protobuf sync when offline.
-- CLI target: direct SQLite/file sync.
-- 100% non-destructive: source session files are never modified or deleted.
+- Live RPC injection into Antigravity Desktop language server and direct SQLite/Protobuf sync.
+- 100% non-destructive: CLI session files are never modified or deleted.
 """
 
 import os
@@ -34,6 +32,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
+
 
 def get_desktop_cid(cli_cid):
     """
@@ -52,31 +51,21 @@ def get_desktop_cid(cli_cid):
     """
     return str(uuid.uuid5(uuid.NAMESPACE_OID, f"antigravity-desktop:{cli_cid}"))
 
-def get_cli_cid(desktop_cid):
-    """Deterministically map a Desktop conversation UUID to a dedicated CLI conversation UUID."""
-    return str(uuid.uuid5(uuid.NAMESPACE_OID, f"antigravity-cli:{desktop_cid}"))
 
-# Migration sources (selected in Step 1)
-SRC_CLI = 'cli'
-SRC_DESKTOP = 'desktop'
-
-# Migration directions (named after the TARGET)
+# Migration direction (CLI -> Desktop)
 TO_DESKTOP = 'desktop'
-TO_CLI = 'cli'
 CLI_SOURCE_ENUM = 17          # CORTEX_TRAJECTORY_SOURCE_CLI
 CLI_SOURCE_NAME = 'CORTEX_TRAJECTORY_SOURCE_CLI'
 
-def map_cid(cid, direction):
-    return get_desktop_cid(cid) if direction == TO_DESKTOP else get_cli_cid(cid)
 
-def direction_label(direction):
-    if direction == TO_DESKTOP:
-        return 'Antigravity CLI -> Antigravity Desktop'
-    return 'Antigravity Desktop -> Antigravity CLI'
+def map_cid(cid, direction=TO_DESKTOP):
+    return get_desktop_cid(cid)
+
 
 # ---------------------------------------------------------------------------
 # Cross-Platform Terminal & Keypress Handling
 # ---------------------------------------------------------------------------
+
 
 def init_terminal():
     """Enable ANSI virtual terminal processing on Windows and UTF-8 encoding."""
@@ -102,17 +91,21 @@ def init_terminal():
         except Exception:
             pass
 
+
 def hide_cursor():
     sys.stdout.write('\033[?25l')
     sys.stdout.flush()
+
 
 def show_cursor():
     sys.stdout.write('\033[?25h')
     sys.stdout.flush()
 
+
 def clear_screen():
     sys.stdout.write('\033[2J\033[H')
     sys.stdout.flush()
+
 
 def get_terminal_size():
     try:
@@ -121,6 +114,7 @@ def get_terminal_size():
     except Exception:
         return 90, 24
 
+
 def get_key():
     """Wait for a single keypress cross-platform and return a normalized string."""
     if os.name == 'nt':
@@ -128,26 +122,41 @@ def get_key():
         ch = msvcrt.getch()
         if ch in (b'\x00', b'\xe0'):
             ch2 = msvcrt.getch()
-            if ch2 == b'H': return 'UP'
-            if ch2 == b'P': return 'DOWN'
-            if ch2 == b'K': return 'LEFT'
-            if ch2 == b'M': return 'RIGHT'
-            if ch2 == b'G': return 'HOME'
-            if ch2 == b'O': return 'END'
-            if ch2 == b'I': return 'PAGE_UP'
-            if ch2 == b'Q': return 'PAGE_DOWN'
+            if ch2 == b'H':
+                return 'UP'
+            if ch2 == b'P':
+                return 'DOWN'
+            if ch2 == b'K':
+                return 'LEFT'
+            if ch2 == b'M':
+                return 'RIGHT'
+            if ch2 == b'G':
+                return 'HOME'
+            if ch2 == b'O':
+                return 'END'
+            if ch2 == b'I':
+                return 'PAGE_UP'
+            if ch2 == b'Q':
+                return 'PAGE_DOWN'
             return 'SPECIAL'
-        if ch in (b'\r', b'\n'): return 'ENTER'
-        if ch == b' ': return 'SPACE'
-        if ch == b'\x1b': return 'ESC'
-        if ch == b'\t': return 'TAB'
-        if ch in (b'\x03', b'\x1a'): return 'CTRL_C'
+        if ch in (b'\r', b'\n'):
+            return 'ENTER'
+        if ch == b' ':
+            return 'SPACE'
+        if ch == b'\x1b':
+            return 'ESC'
+        if ch == b'\t':
+            return 'TAB'
+        if ch in (b'\x03', b'\x1a'):
+            return 'CTRL_C'
         try:
             return ch.decode('latin1').lower()
         except Exception:
             return ''
     else:
-        import tty, termios, select
+        import tty
+        import termios
+        import select
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
@@ -159,20 +168,30 @@ def get_key():
                     ch2 = sys.stdin.read(1)
                     if ch2 == '[':
                         ch3 = sys.stdin.read(1)
-                        if ch3 == 'A': return 'UP'
-                        if ch3 == 'B': return 'DOWN'
-                        if ch3 == 'C': return 'RIGHT'
-                        if ch3 == 'D': return 'LEFT'
-                        if ch3 == 'H': return 'HOME'
-                        if ch3 == 'F': return 'END'
+                        if ch3 == 'A':
+                            return 'UP'
+                        if ch3 == 'B':
+                            return 'DOWN'
+                        if ch3 == 'C':
+                            return 'RIGHT'
+                        if ch3 == 'D':
+                            return 'LEFT'
+                        if ch3 == 'H':
+                            return 'HOME'
+                        if ch3 == 'F':
+                            return 'END'
                         if ch3 in ('5', '6'):
                             sys.stdin.read(1)  # consume ~
                             return 'PAGE_UP' if ch3 == '5' else 'PAGE_DOWN'
                 return 'ESC'
-            if ch in ('\r', '\n'): return 'ENTER'
-            if ch == ' ': return 'SPACE'
-            if ch == '\t': return 'TAB'
-            if ch == '\x03': return 'CTRL_C'
+            if ch in ('\r', '\n'):
+                return 'ENTER'
+            if ch == ' ':
+                return 'SPACE'
+            if ch == '\t':
+                return 'TAB'
+            if ch == '\x03':
+                return 'CTRL_C'
             return ch.lower()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -181,6 +200,7 @@ def get_key():
 # Protobuf Varint & Wire Helpers (Zero External Dependencies)
 # ---------------------------------------------------------------------------
 
+
 def encode_varint(n):
     res = bytearray()
     while n >= 128:
@@ -188,6 +208,7 @@ def encode_varint(n):
         n >>= 7
     res.append(n)
     return bytes(res)
+
 
 def parse_fields(data, start=0, end=None):
     if end is None:
@@ -239,8 +260,10 @@ def parse_fields(data, start=0, end=None):
             idx += 4
             fields.append((field_num, wire_type, val))
         else:
-            raise ValueError(f"Unsupported wire type {wire_type} at offset {idx}")
+            raise ValueError(
+                f"Unsupported wire type {wire_type} at offset {idx}")
     return fields
+
 
 def encode_field(field_num, wire_type, val):
     tag = (field_num << 3) | wire_type
@@ -254,12 +277,14 @@ def encode_field(field_num, wire_type, val):
         res.extend(val)
     return bytes(res)
 
+
 def serialize_fields(fields):
     return b''.join(encode_field(f[0], f[1], f[2]) for f in fields)
 
 # ---------------------------------------------------------------------------
 # Path & Configuration Discovery
 # ---------------------------------------------------------------------------
+
 
 def normalize_path(p):
     """Normalize file path for cross-platform comparisons."""
@@ -269,6 +294,7 @@ def normalize_path(p):
     if p.startswith('file:///'):
         p = p[8:]
     return p.replace('\\', '/').rstrip('/').lower()
+
 
 def is_session_for_project(session, project):
     """Check if a session belongs to a project by project_id or workspace URI."""
@@ -280,7 +306,8 @@ def is_session_for_project(session, project):
         return True
 
     # Check workspace URIs against project folder
-    proj_path = normalize_path(project.get('readablePath') or project.get('folderUri', ''))
+    proj_path = normalize_path(project.get(
+        'readablePath') or project.get('folderUri', ''))
     if not proj_path:
         return False
 
@@ -298,6 +325,7 @@ def is_session_for_project(session, project):
 
     return False
 
+
 def get_default_paths():
     home = os.path.expanduser('~')
     gemini_dir = os.path.join(home, '.gemini')
@@ -305,6 +333,7 @@ def get_default_paths():
     app_dir = os.path.join(gemini_dir, 'antigravity')
     config_dir = os.path.join(gemini_dir, 'config')
     return cli_dir, app_dir, config_dir
+
 
 def discover_projects(config_dir):
     projects_dir = os.path.join(config_dir, 'projects')
@@ -325,7 +354,8 @@ def discover_projects(config_dir):
                 pid = data.get('id')
                 name = data.get('name', 'Unnamed Project')
                 folder_uri = ''
-                resources = data.get('projectResources', {}).get('resources', [])
+                resources = data.get('projectResources', {}
+                                     ).get('resources', [])
                 if resources and 'gitFolder' in resources[0]:
                     folder_uri = resources[0]['gitFolder'].get('folderUri', '')
                 readable_path = ''
@@ -334,7 +364,8 @@ def discover_projects(config_dir):
                     if clean_uri.startswith('file:///'):
                         readable_path = clean_uri[8:]
                         if len(readable_path) > 2 and readable_path[1] == ':':
-                            readable_path = readable_path[0].upper() + readable_path[1:]
+                            readable_path = readable_path[0].upper(
+                            ) + readable_path[1:]
                 projects.append({
                     'id': pid,
                     'name': name,
@@ -347,6 +378,7 @@ def discover_projects(config_dir):
     projects.sort(key=lambda p: p['name'].lower())
     return projects
 
+
 def check_installations(cli_dir, app_dir, config_dir):
     """Return a list of human-readable problems; empty list means both installs are usable."""
     problems = []
@@ -354,10 +386,13 @@ def check_installations(cli_dir, app_dir, config_dir):
         if not os.path.isdir(d):
             problems.append(f"{name} not found ({d})")
         elif not os.path.exists(os.path.join(d, 'conversation_summaries.db')):
-            problems.append(f"{name} has no session database ({os.path.join(d, 'conversation_summaries.db')})")
+            problems.append(
+                f"{name} has no session database ({os.path.join(d, 'conversation_summaries.db')})")
     if not discover_projects(config_dir):
-        problems.append(f"No Antigravity projects found ({os.path.join(config_dir, 'projects')})")
+        problems.append(
+            f"No Antigravity projects found ({os.path.join(config_dir, 'projects')})")
     return problems
+
 
 def _read_cids(sum_db):
     if not os.path.exists(sum_db):
@@ -371,6 +406,7 @@ def _read_cids(sum_db):
     except Exception:
         return set()
 
+
 def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP):
     """Load all valid root sessions from src_dir, grouping subagents under root parents."""
     sum_db = os.path.join(src_dir, 'conversation_summaries.db')
@@ -379,17 +415,15 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
 
     con = sqlite3.connect(sum_db)
     cur = con.cursor()
-    cols = [c[1] for c in cur.execute('PRAGMA table_info(conversation_summaries)').fetchall()]
-    rows = cur.execute('SELECT * FROM conversation_summaries ORDER BY last_modified_time DESC').fetchall()
+    cols = [c[1] for c in cur.execute(
+        'PRAGMA table_info(conversation_summaries)').fetchall()]
+    rows = cur.execute(
+        'SELECT * FROM conversation_summaries ORDER BY last_modified_time DESC').fetchall()
     all_sessions = []
     for r in rows:
         d = dict(zip(cols, r))
         all_sessions.append(d)
     con.close()
-
-    # Sessions in src that are copies of sessions from dst (migrated earlier the other way)
-    back_map = get_cli_cid if direction == TO_DESKTOP else get_desktop_cid
-    foreign_copies = {back_map(x) for x in _read_cids(os.path.join(dst_dir, 'conversation_summaries.db'))}
 
     # Query destination summaries to check what's already migrated
     app_migrated_map = {}
@@ -430,16 +464,18 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
             # FILTER OUT GHOST / CORRUPTED EMPTY SESSIONS
             if (step_count == 0 and not raw_title.strip() and not raw_preview.strip()) or mod_time.startswith('0001'):
                 continue
-            # Skip CLI-watcher mirrors inside the Desktop store and copies migrated from the other side
-            if (s.get('source') or '') == CLI_SOURCE_NAME or cid in foreign_copies:
+            # Skip CLI-watcher mirrors inside the Desktop store
+            if (s.get('source') or '') == CLI_SOURCE_NAME:
                 continue
 
             # Determine migration status (check deterministic mapped cid or native cid in dst_dir/conversations)
             d_cid = map_cid(cid, direction)
             app_conv_db = os.path.join(dst_dir, 'conversations', f'{d_cid}.db')
-            native_conv_db = os.path.join(dst_dir, 'conversations', f'{cid}.db')
+            native_conv_db = os.path.join(
+                dst_dir, 'conversations', f'{cid}.db')
             app_info = app_migrated_map.get(d_cid) or app_migrated_map.get(cid)
-            has_desktop_db = os.path.exists(app_conv_db) or (os.path.exists(native_conv_db) and app_info and app_info['source'] != 'CORTEX_TRAJECTORY_SOURCE_CLI')
+            has_desktop_db = os.path.exists(app_conv_db) or (os.path.exists(
+                native_conv_db) and app_info and app_info['source'] != 'CORTEX_TRAJECTORY_SOURCE_CLI')
             if has_desktop_db and app_info and app_info['source'] != 'CORTEX_TRAJECTORY_SOURCE_CLI':
                 if app_info['project_id'] == target_project_id:
                     status = 'Migrated'
@@ -455,15 +491,18 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
             for ann_base, check_id in ((src_dir, cid), (dst_dir, d_cid), (dst_dir, cid)):
                 if title:
                     break
-                ann_path = os.path.join(ann_base, 'annotations', f'{check_id}.pbtxt')
+                ann_path = os.path.join(
+                    ann_base, 'annotations', f'{check_id}.pbtxt')
                 if os.path.exists(ann_path):
                     try:
                         with open(ann_path, 'r', encoding='utf-8') as af:
                             content = af.read()
                             if 'title:"' in content:
-                                title = content.split('title:"')[1].split('"')[0]
+                                title = content.split('title:"')[
+                                    1].split('"')[0]
                             elif 'title: "' in content:
-                                title = content.split('title: "')[1].split('"')[0]
+                                title = content.split('title: "')[
+                                    1].split('"')[0]
                     except Exception:
                         pass
             if not title and app_info and app_info.get('title'):
@@ -501,6 +540,7 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
 # Antigravity 2.0 Live RPC Client
 # ---------------------------------------------------------------------------
 
+
 def is_pid_running(pid):
     """Fast check whether a process ID is currently alive cross-platform."""
     if not pid or pid <= 0:
@@ -529,6 +569,7 @@ def is_pid_running(pid):
         except OSError:
             return False
 
+
 def is_port_listening(port, timeout=0.05):
     """Fast probe to check if a TCP port is actively listening on localhost."""
     if not port or port <= 0:
@@ -538,6 +579,7 @@ def is_port_listening(port, timeout=0.05):
             return True
     except (socket.timeout, ConnectionRefusedError, OSError):
         return False
+
 
 def get_process_name(pid):
     """Cross-platform process name lookup for a given PID."""
@@ -571,6 +613,7 @@ def get_process_name(pid):
             pass
     return ""
 
+
 def detect_live_hub(app_dir):
     """
     Detect running Antigravity Desktop Language Server.
@@ -580,11 +623,13 @@ def detect_live_hub(app_dir):
     if not os.path.exists(daemon_dir):
         return None
 
-    hub_files = [f for f in os.listdir(daemon_dir) if f.startswith('hub_') and f.endswith('.json')]
+    hub_files = [f for f in os.listdir(daemon_dir) if f.startswith(
+        'hub_') and f.endswith('.json')]
     if not hub_files:
         return None
 
-    hub_files.sort(key=lambda f: os.path.getmtime(os.path.join(daemon_dir, f)), reverse=True)
+    hub_files.sort(key=lambda f: os.path.getmtime(
+        os.path.join(daemon_dir, f)), reverse=True)
     # Use proxy-free opener for localhost to avoid Windows system proxy discovery delays
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -627,9 +672,11 @@ def detect_live_hub(app_dir):
             continue
     return None
 
+
 def rpc_write_summary(hub, cascade_id, summary_dict):
     url = f"http://127.0.0.1:{hub['httpPort']}/exa.language_server_pb.LanguageServerService/JetboxWriteSummary"
-    payload = json.dumps({'cascadeId': cascade_id, 'summary': summary_dict}).encode('utf-8')
+    payload = json.dumps(
+        {'cascadeId': cascade_id, 'summary': summary_dict}).encode('utf-8')
     req = urllib.request.Request(url, data=payload, headers={
         'Content-Type': 'application/json',
         'x-codeium-csrf-token': hub['csrfToken']
@@ -637,6 +684,7 @@ def rpc_write_summary(hub, cascade_id, summary_dict):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=5) as resp:
         return resp.status == 200
+
 
 def rpc_update_annotations(hub, cascade_id, title):
     url = f"http://127.0.0.1:{hub['httpPort']}/exa.language_server_pb.LanguageServerService/UpdateConversationAnnotations"
@@ -657,6 +705,7 @@ def rpc_update_annotations(hub, cascade_id, title):
 # Migration Logic (100% Non-destructive)
 # ---------------------------------------------------------------------------
 
+
 def to_rfc3339(ts_str):
     """Convert SQLite timestamp ('YYYY-MM-DD HH:MM:SS.ffffff+00:00') to strict RFC3339 ('YYYY-MM-DDTHH:MM:SS.ffffffZ')."""
     if not ts_str or not isinstance(ts_str, str):
@@ -673,6 +722,7 @@ def to_rfc3339(ts_str):
         ts = ts + 'Z'
     return ts
 
+
 def ensure_checkpoint_title_in_db(cur, title):
     """
     Ensure that computeCascadeTitle in language_server.exe (which checks steps 0..49 for
@@ -682,7 +732,8 @@ def ensure_checkpoint_title_in_db(cur, title):
     if not title:
         return
     try:
-        rows = cur.execute('SELECT idx, step_type, status, metadata, step_payload FROM steps WHERE idx < 50 ORDER BY idx ASC').fetchall()
+        rows = cur.execute(
+            'SELECT idx, step_type, status, metadata, step_payload FROM steps WHERE idx < 50 ORDER BY idx ASC').fetchall()
         if not rows:
             return
         # 1. If any step in 0..49 already has step_type == 23, update its field 30 -> subfield 4
@@ -695,22 +746,27 @@ def ensure_checkpoint_title_in_db(cur, title):
                     if fn == 30 and wt == 2:
                         cp_fields = [f for f in parse_fields(val) if f[0] != 4]
                         cp_fields.insert(0, (4, 2, title.encode('utf-8')))
-                        new_s_fields.append((30, 2, serialize_fields(cp_fields)))
+                        new_s_fields.append(
+                            (30, 2, serialize_fields(cp_fields)))
                         updated = True
                     else:
                         new_s_fields.append((fn, wt, val))
                 if updated:
-                    cur.execute('UPDATE steps SET step_payload = ? WHERE idx = ?', (serialize_fields(new_s_fields), s_idx))
+                    cur.execute('UPDATE steps SET step_payload = ? WHERE idx = ?',
+                                (serialize_fields(new_s_fields), s_idx))
                     return
 
         # 2. If there is a system notice step (step_type == 101) in 0..49, convert it into a checkpoint title step
         for s_idx, s_type, s_status, s_meta, s_payload in rows:
             if s_type == 101 and s_status == 3 and s_payload:
-                s_fields = [f for f in parse_fields(s_payload) if f[0] in (4, 5)]
+                s_fields = [f for f in parse_fields(
+                    s_payload) if f[0] in (4, 5)]
                 s_fields.insert(0, (1, 0, 23))
-                cp_bytes = serialize_fields([(4, 2, title.encode('utf-8')), (9, 0, 1), (12, 0, s_idx), (24, 0, 1), (25, 0, 0)])
+                cp_bytes = serialize_fields(
+                    [(4, 2, title.encode('utf-8')), (9, 0, 1), (12, 0, s_idx), (24, 0, 1), (25, 0, 0)])
                 s_fields.append((30, 2, cp_bytes))
-                cur.execute('UPDATE steps SET step_type = 23, step_payload = ? WHERE idx = ?', (serialize_fields(s_fields), s_idx))
+                cur.execute('UPDATE steps SET step_type = 23, step_payload = ? WHERE idx = ?',
+                            (serialize_fields(s_fields), s_idx))
                 return
 
         # 3. For short sessions (< 50 steps) with no step_type 23 or 101, append a checkpoint title step at max_idx + 1
@@ -730,14 +786,17 @@ def ensure_checkpoint_title_in_db(cur, title):
                     else:
                         m_fields.append((fn, wt, val))
                 meta_bytes = serialize_fields(m_fields)
-            cp_bytes = serialize_fields([(4, 2, title.encode('utf-8')), (9, 0, 1), (12, 0, new_idx), (24, 0, 1), (25, 0, 0)])
-            payload_bytes = serialize_fields([(1, 0, 23), (4, 0, 3), (5, 2, meta_bytes), (30, 2, cp_bytes)])
+            cp_bytes = serialize_fields([(4, 2, title.encode(
+                'utf-8')), (9, 0, 1), (12, 0, new_idx), (24, 0, 1), (25, 0, 0)])
+            payload_bytes = serialize_fields(
+                [(1, 0, 23), (4, 0, 3), (5, 2, meta_bytes), (30, 2, cp_bytes)])
             cur.execute(
                 'INSERT INTO steps (idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format) VALUES (?, 23, 3, 0, ?, ?, 0)',
                 (new_idx, meta_bytes, payload_bytes)
             )
     except Exception:
         pass
+
 
 def replace_uuids_in_bytes(blob, byte_id_map):
     """Replace 36-byte ASCII UUIDs in a binary blob (length-invariant for Protobuf)."""
@@ -749,10 +808,12 @@ def replace_uuids_in_bytes(blob, byte_id_map):
             res = res.replace(old_b, new_b)
     return res
 
+
 def migrate_single_session(cid, src_dir, dst_dir, target_project, hub=None, title=None, id_map=None, direction=TO_DESKTOP):
     """Migrate a single conversation ID from src_dir into dst_dir using its deterministic mapped UUID."""
     d_cid = (id_map or {}).get(cid) or map_cid(cid, direction)
-    byte_id_map = {k.encode('utf-8'): v.encode('utf-8') for k, v in (id_map or {cid: d_cid}).items()}
+    byte_id_map = {k.encode('utf-8'): v.encode('utf-8')
+                   for k, v in (id_map or {cid: d_cid}).items()}
     # Also include brain directory path replacement if present in blobs
     src_db = os.path.join(src_dir, 'conversations', f'{cid}.db')
     dst_db = os.path.join(dst_dir, 'conversations', f'{d_cid}.db')
@@ -767,11 +828,13 @@ def migrate_single_session(cid, src_dir, dst_dir, target_project, hub=None, titl
     if os.path.exists(dst_db):
         con = sqlite3.connect(dst_db)
         cur = con.cursor()
-        traj_source = CLI_SOURCE_ENUM if direction == TO_CLI else 1
-        cur.execute('UPDATE trajectory_meta SET cascade_id = ?, source = ?', (d_cid, traj_source))
+        traj_source = 1  # Desktop trajectory source
+        cur.execute(
+            'UPDATE trajectory_meta SET cascade_id = ?, source = ?', (d_cid, traj_source))
 
         try:
-            blob_row = cur.execute('SELECT data FROM trajectory_metadata_blob WHERE id = "main"').fetchone()
+            blob_row = cur.execute(
+                'SELECT data FROM trajectory_metadata_blob WHERE id = "main"').fetchone()
             if blob_row and blob_row[0]:
                 raw_blob = replace_uuids_in_bytes(blob_row[0], byte_id_map)
                 meta_fields = parse_fields(raw_blob)
@@ -780,7 +843,8 @@ def migrate_single_session(cid, src_dir, dst_dir, target_project, hub=None, titl
                 has_ws = False
                 for f in meta_fields:
                     if f[0] == 18:
-                        new_meta.append((18, 2, target_project['id'].encode('utf-8')))
+                        new_meta.append(
+                            (18, 2, target_project['id'].encode('utf-8')))
                         has_proj = True
                     elif f[0] == 7 and folder_uri:
                         new_meta.append((7, 2, folder_uri.encode('utf-8')))
@@ -788,40 +852,48 @@ def migrate_single_session(cid, src_dir, dst_dir, target_project, hub=None, titl
                     else:
                         new_meta.append(f)
                 if not has_proj:
-                    new_meta.append((18, 2, target_project['id'].encode('utf-8')))
+                    new_meta.append(
+                        (18, 2, target_project['id'].encode('utf-8')))
                 if not has_ws and folder_uri:
                     new_meta.append((7, 2, folder_uri.encode('utf-8')))
                 new_blob = serialize_fields(new_meta)
-                cur.execute('UPDATE trajectory_metadata_blob SET data = ? WHERE id = "main"', (new_blob,))
+                cur.execute(
+                    'UPDATE trajectory_metadata_blob SET data = ? WHERE id = "main"', (new_blob,))
         except Exception:
             pass
 
         # Rewrite UUID references in steps, gen_metadata, and parent_references
         try:
-            step_rows = cur.execute('SELECT idx, metadata, step_payload FROM steps').fetchall()
+            step_rows = cur.execute(
+                'SELECT idx, metadata, step_payload FROM steps').fetchall()
             for s_idx, s_meta, s_payload in step_rows:
                 new_m = replace_uuids_in_bytes(s_meta, byte_id_map)
                 new_p = replace_uuids_in_bytes(s_payload, byte_id_map)
                 if new_m != s_meta or new_p != s_payload:
-                    cur.execute('UPDATE steps SET metadata = ?, step_payload = ? WHERE idx = ?', (new_m, new_p, s_idx))
+                    cur.execute(
+                        'UPDATE steps SET metadata = ?, step_payload = ? WHERE idx = ?', (new_m, new_p, s_idx))
         except Exception:
             pass
 
         try:
-            gen_rows = cur.execute('SELECT idx, data FROM gen_metadata').fetchall()
+            gen_rows = cur.execute(
+                'SELECT idx, data FROM gen_metadata').fetchall()
             for g_idx, g_data in gen_rows:
                 new_g = replace_uuids_in_bytes(g_data, byte_id_map)
                 if new_g != g_data:
-                    cur.execute('UPDATE gen_metadata SET data = ? WHERE idx = ?', (new_g, g_idx))
+                    cur.execute(
+                        'UPDATE gen_metadata SET data = ? WHERE idx = ?', (new_g, g_idx))
         except Exception:
             pass
 
         try:
-            pref_rows = cur.execute('SELECT idx, data FROM parent_references').fetchall()
+            pref_rows = cur.execute(
+                'SELECT idx, data FROM parent_references').fetchall()
             for p_idx, p_data in pref_rows:
                 new_pr = replace_uuids_in_bytes(p_data, byte_id_map)
                 if new_pr != p_data:
-                    cur.execute('UPDATE parent_references SET data = ? WHERE idx = ?', (new_pr, p_idx))
+                    cur.execute(
+                        'UPDATE parent_references SET data = ? WHERE idx = ?', (new_pr, p_idx))
         except Exception:
             pass
 
@@ -863,6 +935,7 @@ def migrate_single_session(cid, src_dir, dst_dir, target_project, hub=None, titl
                 af.write(f'title:"{escaped_title}"\n')
         except Exception:
             pass
+
 
 def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri, direction=TO_DESKTOP):
     """Clean protobuf raw_summary: set/strip source (field 20) per direction and update projectId (field 18)."""
@@ -918,12 +991,10 @@ def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri, dir
             ann_bytes = encode_field(1, 2, title.encode('utf-8'))
             new_fields.append((15, 2, ann_bytes))
 
-        if direction == TO_CLI:
-            new_fields.append((20, 0, CLI_SOURCE_ENUM))
-
         return serialize_fields(new_fields)
     except Exception:
         return raw_summary
+
 
 def update_proto_summaries_file(app_dir, cid, new_raw_summary, mtime_sec=None):
     """Ensure agyhub_summaries_proto.pb has the clean summary AND file_mod_times entry for persistence."""
@@ -970,10 +1041,12 @@ def update_proto_summaries_file(app_dir, cid, new_raw_summary, mtime_sec=None):
 
         root_fields = []
         for ecid, raw in entries.items():
-            entry_bytes = encode_field(1, 2, ecid.encode('utf-8')) + encode_field(2, 2, raw)
+            entry_bytes = encode_field(1, 2, ecid.encode(
+                'utf-8')) + encode_field(2, 2, raw)
             root_fields.append((1, 2, entry_bytes))
         for ecid, (mwt, mval) in mod_times.items():
-            mt_bytes = encode_field(1, 2, ecid.encode('utf-8')) + encode_field(2, mwt, mval)
+            mt_bytes = encode_field(1, 2, ecid.encode(
+                'utf-8')) + encode_field(2, mwt, mval)
             root_fields.append((2, 2, mt_bytes))
         root_fields.extend(other_fields)
 
@@ -983,11 +1056,14 @@ def update_proto_summaries_file(app_dir, cid, new_raw_summary, mtime_sec=None):
     except Exception:
         pass
 
+
 def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, id_map=None, direction=TO_DESKTOP):
     """Sync summaries into the target store (Desktop: live RPC or direct store write; CLI: direct write)."""
     cid = session['conversation_id']
-    d_cid = (id_map or {}).get(cid) or session.get('desktop_cid') or map_cid(cid, direction)
-    byte_id_map = {k.encode('utf-8'): v.encode('utf-8') for k, v in (id_map or {cid: d_cid}).items()}
+    d_cid = (id_map or {}).get(cid) or session.get(
+        'desktop_cid') or map_cid(cid, direction)
+    byte_id_map = {k.encode('utf-8'): v.encode('utf-8')
+                   for k, v in (id_map or {cid: d_cid}).items()}
     title = session['title']
     preview = session['preview'] or title
     step_count = session['step_count']
@@ -1000,9 +1076,19 @@ def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, 
     if os.path.exists(src_sum_db):
         con = sqlite3.connect(src_sum_db)
         cur = con.cursor()
-        r = cur.execute('SELECT raw_summary, last_modified_time, last_user_input_time, last_user_input_step_index FROM conversation_summaries WHERE conversation_id = ?', (cid,)).fetchone()
-        if r:
-            raw_summary, last_mod, last_input_time, last_input_step = r
+        try:
+            r = cur.execute(
+                'SELECT raw_summary, last_modified_time, last_user_input_time, last_user_input_step_index FROM conversation_summaries WHERE conversation_id = ?', (cid,)).fetchone()
+            if r:
+                raw_summary, last_mod, last_input_time, last_input_step = r
+        except sqlite3.OperationalError:
+            try:
+                r = cur.execute(
+                    'SELECT raw_summary, last_modified_time FROM conversation_summaries WHERE conversation_id = ?', (cid,)).fetchone()
+                if r:
+                    raw_summary, last_mod = r
+            except Exception:
+                pass
         con.close()
 
     folder_uri = target_project.get('folderUri', '')
@@ -1015,9 +1101,10 @@ def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, 
         ws_uri_json = json.dumps([ws_uri])
 
     dst_db = os.path.join(dst_dir, 'conversations', f'{d_cid}.db')
-    mtime_sec = int(os.path.getmtime(dst_db)) if os.path.exists(dst_db) else int(time.time())
+    mtime_sec = int(os.path.getmtime(dst_db)) if os.path.exists(
+        dst_db) else int(time.time())
 
-    if hub and direction == TO_DESKTOP:
+    if hub:
         # Allow fsnotify (handleEvent) in language_server.exe to process the dst_db write
         # and record Store.fileModTimes[d_cid] = mtime(dst_db) in memory BEFORE we write
         # the canonical summary and title via RPC.
@@ -1053,7 +1140,8 @@ def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, 
         rpc_update_annotations(hub, d_cid, title)
 
     # Clean and update raw protobuf summary (strip CLI source, update projectId, replace cid -> d_cid)
-    new_raw_summary = clean_and_update_raw_summary(raw_summary, title, target_project['id'], folder_uri, direction)
+    new_raw_summary = clean_and_update_raw_summary(
+        raw_summary, title, target_project['id'], folder_uri, direction)
     new_raw_summary = replace_uuids_in_bytes(new_raw_summary, byte_id_map)
 
     # Update backing SQLite DB
@@ -1062,20 +1150,38 @@ def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, 
         con = sqlite3.connect(app_sum_db)
         cur = con.cursor()
 
-        cur.execute('''INSERT INTO conversation_summaries
-            (conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, source, project_id, nesting_depth, parent_conversation_id, last_user_input_time, last_user_input_step_index, raw_summary)
-            VALUES (?, ?, ?, ?, ?, ?, 'CASCADE_RUN_STATUS_IDLE', '', ?, 0, '', ?, ?, ?)
-            ON CONFLICT(conversation_id) DO UPDATE SET
-            title = excluded.title,
-            preview = excluded.preview,
-            step_count = excluded.step_count,
-            last_modified_time = excluded.last_modified_time,
-            workspace_uris = excluded.workspace_uris,
-            status = 'CASCADE_RUN_STATUS_IDLE',
-            source = '',
-            project_id = excluded.project_id,
-            raw_summary = excluded.raw_summary
-        ''', (d_cid, title, preview, step_count, last_mod, ws_uri_json, target_project['id'], last_input_time, last_input_step, new_raw_summary))
+        cols = {c[1] for c in cur.execute(
+            'PRAGMA table_info(conversation_summaries)').fetchall()}
+        if 'last_user_input_time' in cols:
+            cur.execute('''INSERT INTO conversation_summaries
+                (conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, source, project_id, nesting_depth, parent_conversation_id, last_user_input_time, last_user_input_step_index, raw_summary)
+                VALUES (?, ?, ?, ?, ?, ?, 'CASCADE_RUN_STATUS_IDLE', '', ?, 0, '', ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                title = excluded.title,
+                preview = excluded.preview,
+                step_count = excluded.step_count,
+                last_modified_time = excluded.last_modified_time,
+                workspace_uris = excluded.workspace_uris,
+                status = 'CASCADE_RUN_STATUS_IDLE',
+                source = '',
+                project_id = excluded.project_id,
+                raw_summary = excluded.raw_summary
+            ''', (d_cid, title, preview, step_count, last_mod, ws_uri_json, target_project['id'], last_input_time, last_input_step, new_raw_summary))
+        else:
+            cur.execute('''INSERT INTO conversation_summaries
+                (conversation_id, title, preview, step_count, last_modified_time, workspace_uris, status, source, project_id, nesting_depth, parent_conversation_id, raw_summary)
+                VALUES (?, ?, ?, ?, ?, ?, 'CASCADE_RUN_STATUS_IDLE', '', ?, 0, '', ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                title = excluded.title,
+                preview = excluded.preview,
+                step_count = excluded.step_count,
+                last_modified_time = excluded.last_modified_time,
+                workspace_uris = excluded.workspace_uris,
+                status = 'CASCADE_RUN_STATUS_IDLE',
+                source = '',
+                project_id = excluded.project_id,
+                raw_summary = excluded.raw_summary
+            ''', (d_cid, title, preview, step_count, last_mod, ws_uri_json, target_project['id'], new_raw_summary))
 
         try:
             cur.execute('''UPDATE conversations_fts 
@@ -1088,15 +1194,21 @@ def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, 
         con.close()
 
     # Update agyhub_summaries_proto.pb directly (preserving file_mod_times)
-    if direction == TO_DESKTOP:
-        update_proto_summaries_file(dst_dir, d_cid, new_raw_summary, mtime_sec=mtime_sec)
+    update_proto_summaries_file(
+        dst_dir, d_cid, new_raw_summary, mtime_sec=mtime_sec)
 
 # ---------------------------------------------------------------------------
 # Interactive TUI Screens
 # ---------------------------------------------------------------------------
 
+
 def prompt_desktop_not_running():
-    """Display warning when Antigravity Desktop is not running, wait for key, return to Step 1."""
+    """
+    Display warning when Antigravity Desktop is not running.
+    Returns:
+        'RETRY': user pressed [Enter] or [Space]
+        'QUIT': user pressed [Esc], [q], or [Ctrl+C]
+    """
     clear_screen()
     cols, _ = get_terminal_size()
     w = max(88, min(cols, 105))
@@ -1106,94 +1218,24 @@ def prompt_desktop_not_running():
     print(f"{border}\033[0m\n")
     print("Migrating sessions into Antigravity Desktop requires the Desktop app to be open")
     print("so sessions can be registered live with its language server.\n")
-    print("Please launch Antigravity Desktop, then try again.\n")
-    print("\033[90mPress any key to return to source selection...\033[0m")
+    print("Please launch Antigravity Desktop, then:\n")
+    print("  \033[1;32m[Enter]\033[0m  Retry connection")
+    print("  \033[1;90m[Esc/q]\033[0m  Quit application\n")
     sys.stdout.flush()
-    get_key()
-
-def select_source_screen(initial_idx=1):
-    """
-    Screen 1: Select migration source (Antigravity CLI or Antigravity Desktop).
-    Row 0: < Exit
-    Row 1: Antigravity CLI (Migrate to Antigravity Desktop)
-    Row 2: Antigravity Desktop (Migrate to Antigravity CLI)
-    """
-    sources = [
-        {
-            'id': SRC_CLI,
-            'name': 'Antigravity CLI',
-            'desc': 'Migrate sessions from Antigravity CLI -> Antigravity Desktop'
-        },
-        {
-            'id': SRC_DESKTOP,
-            'name': 'Antigravity Desktop',
-            'desc': 'Migrate sessions from Antigravity Desktop -> Antigravity CLI'
-        }
-    ]
-    cursor_idx = max(0, min(initial_idx, 2))
-    total_rows = 3  # 0: Exit, 1: CLI, 2: Desktop
-
     while True:
-        clear_screen()
-        cols, rows = get_terminal_size()
-        w = max(88, min(cols, 105))
-        border = '=' * w
-
-        print(f"\033[1;36m{border}")
-        print(f"             Antigravity Session Migrator: CLI <-> Desktop             ")
-        print(f"{border}\033[0m")
-        print("\n\033[1mStep 1: Select Migration Source\033[0m")
-        print("\033[90mUse [Up/Down] arrows to navigate, [Enter] to select, [Esc/q] to exit\033[0m\n")
-
-        # Row 0: Exit Button
-        is_exit_cur = (cursor_idx == 0)
-        exit_text = "  < Exit Application  "
-        if is_exit_cur:
-            print(f"\033[1;31;7m[ {exit_text} ]\033[0m   \033[90m(Press Enter or Esc to exit)\033[0m")
-        else:
-            print(f"\033[31m[ {exit_text} ]\033[0m")
-        print("\033[90m" + ("-" * w) + "\033[0m")
-
-        for idx, s in enumerate(sources, 1):
-            is_cur = (idx == cursor_idx)
-            ptr = "\033[1;36m>\033[0m " if is_cur else "  "
-            name_str = s['name'][:22].ljust(22)
-            desc_str = f"({s['desc']})"
-            line = f"{ptr}\033[1m{name_str}\033[0m \033[90m{desc_str}\033[0m"
-            plain_line = f"{ptr}{name_str} {desc_str}"
-
-            if is_cur:
-                print(f"\033[7m{plain_line}\033[0m")
-            else:
-                print(line)
-
-        print("\033[90m" + ("-" * w) + "\033[0m")
-        sys.stdout.flush()
-
         k = get_key()
-        if k in ('UP', 'k'):
-            cursor_idx = (cursor_idx - 1) % total_rows
-        elif k in ('DOWN', 'j'):
-            cursor_idx = (cursor_idx + 1) % total_rows
-        elif k in ('ESC', 'b', 'LEFT'):
-            return 'QUIT', cursor_idx
-        elif k in ('q', 'CTRL_C'):
-            return 'QUIT', cursor_idx
-        elif k == 'HOME':
-            cursor_idx = 0
-        elif k == 'END':
-            cursor_idx = total_rows - 1
-        elif k == 'ENTER':
-            if cursor_idx == 0:
-                return 'QUIT', cursor_idx
-            return sources[cursor_idx - 1]['id'], cursor_idx
+        if k in ('ENTER', 'SPACE'):
+            return 'RETRY'
+        if k in ('ESC', 'q', 'CTRL_C'):
+            return 'QUIT'
+
 
 def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
     """
-    Screen 2: Select source project via arrow keys and Enter.
-    Row 0: < Back to Source Selection
+    Step 1: Select target project via arrow keys and Enter.
+    Row 0: < Exit Application
     Rows 1..N: projects
-    Esc/b returns to Step 1, q quits.
+    Esc/q quits.
     """
     total = len(projects)
     total_rows = total + 1
@@ -1208,19 +1250,20 @@ def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
         border = '=' * w
 
         print(f"\033[1;36m{border}")
-        print(f"             Antigravity Session Migrator: CLI <-> Desktop             ")
-        print(f"  Direction: \033[1;32m{direction_label(direction)}\033[0m")
+        print(f"             Antigravity Session Migrator: CLI -> Desktop             ")
         print(f"{border}\033[0m")
-        print("\n\033[1mStep 2: Select Source Project\033[0m")
-        print("\033[90mUse [Up/Down] arrows to navigate, [Enter] to select, [Esc/b] to go back, [q] to exit\033[0m\n")
+        print("\n\033[1mStep 1: Select Target Project\033[0m")
+        nav_hint = "Use [Up/Down] arrows to navigate, [Enter] to select, [Esc/q] to exit"
+        print(f"\033[90m{nav_hint}\033[0m\n")
 
-        # Row 0: Back Button
-        is_back_cur = (cursor_idx == 0)
-        back_text = "  < Back to Source Selection  "
-        if is_back_cur:
-            print(f"\033[1;33;7m[ {back_text} ]\033[0m   \033[90m(Press Enter or Esc to change source)\033[0m")
+        # Row 0: Exit Button
+        is_exit_cur = (cursor_idx == 0)
+        exit_text = "  < Exit Application  "
+        if is_exit_cur:
+            hint = "\033[90m(Press Enter or Esc to exit)\033[0m"
+            print(f"\033[1;31;7m[ {exit_text} ]\033[0m   {hint}")
         else:
-            print(f"\033[33m[ {back_text} ]\033[0m")
+            print(f"\033[31m[ {exit_text} ]\033[0m")
         print("\033[90m" + ("-" * w) + "\033[0m")
 
         if cursor_idx >= 1:
@@ -1237,21 +1280,22 @@ def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
             row_idx = actual_idx + 1
             is_cur = (row_idx == cursor_idx)
             ptr = "\033[1;36m>\033[0m " if is_cur else "  "
-            
+
             p_name = p['name'][:20].ljust(20)
             cnt_str = f"[{p.get('session_count', 0)} sessions]".rjust(15)
             path_str = f"({p['readablePath']})"
-            
+
             line = f"{ptr}\033[1m{p_name}\033[0m \033[33m{cnt_str}\033[0m \033[90m{path_str}\033[0m"
             plain_line = f"{ptr}{p_name} {cnt_str} {path_str}"
-            
+
             if is_cur:
                 print(f"\033[7m{plain_line}\033[0m")
             else:
                 print(line)
 
         if total > page_size:
-            print(f"\n  \033[90m... Showing {scroll_offset+1}-{min(scroll_offset+page_size, total)} of {total} projects ...\033[0m")
+            print(
+                f"\n  \033[90m... Showing {scroll_offset+1}-{min(scroll_offset+page_size, total)} of {total} projects ...\033[0m")
 
         print("\033[90m" + ("-" * w) + "\033[0m")
         sys.stdout.flush()
@@ -1275,27 +1319,27 @@ def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
             cursor_idx = 0
         elif k == 'END':
             cursor_idx = total_rows - 1
-        elif k in ('ESC', 'b', 'LEFT'):
-            return 'BACK', cursor_idx
-        elif k in ('q', 'CTRL_C'):
+        elif k in ('ESC', 'q', 'CTRL_C'):
             return 'QUIT', cursor_idx
         elif k == 'ENTER':
             if cursor_idx == 0:
-                return 'BACK', cursor_idx
+                return 'QUIT', cursor_idx
             return projects[cursor_idx - 1], cursor_idx
+
 
 def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
     """
-    Screen 3: Select sessions to migrate.
+    Step 2: Select sessions to migrate.
     Columns are fixed-width padded and aligned.
-    Esc returns to Step 2, q quits.
+    Esc/b returns to Step 1, q quits.
     'f' toggles filtering by selected project.
     """
     BACK_IDX = 0
     selected_set = set()
-    
+
     # Filter by project by default if there are matching sessions
-    matching_sessions = [s for s in all_sessions if is_session_for_project(s, target_project)]
+    matching_sessions = [
+        s for s in all_sessions if is_session_for_project(s, target_project)]
     filter_active = (len(matching_sessions) > 0)
 
     cursor_idx = 1
@@ -1329,18 +1373,21 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
         else:
             filter_note = f"Showing all {len(all_sessions)} sessions - press 'f' to filter"
 
+        proj_title = f"\033[1;32m{target_project['name']}\033[0m \033[90m({target_project['id']})\033[0m"
+
         print(f"\033[1;36m{border}")
-        print(f"  Target Project: \033[1;32m{target_project['name']}\033[0m \033[90m({target_project['id']})\033[0m | Direction: \033[1;36m{direction_label(direction)}\033[0m")
-        print(f"  \033[90m[{filter_note}]\033[0m")
+        print(f"  Target Project: {proj_title}")
+        print(f"  Filter:         \033[90m[{filter_note}]\033[0m")
         print(f"{border}\033[0m")
-        print("\n\033[1mStep 3: Select Sessions to Migrate\033[0m")
+        print("\n\033[1mStep 2: Select Sessions to Migrate\033[0m")
         print("\033[90m[Up/Down] Navigate | [Space/Enter] Toggle | [a] All | [f] Filter | [Esc/b] Back | [q] Quit\033[0m\n")
 
         # ----------------- Row 0: Back Button -----------------
         is_back_cur = (cursor_idx == BACK_IDX)
         back_text = "  < Back to Project Selection  "
         if is_back_cur:
-            print(f"\033[1;33;7m[ {back_text} ]\033[0m   \033[90m(Press Enter or Esc to change project)\033[0m")
+            hint = "\033[90m(Press Enter or Esc to change project)\033[0m"
+            print(f"\033[1;33;7m[ {back_text} ]\033[0m   {hint}")
         else:
             print(f"\033[33m[ {back_text} ]\033[0m")
         print("\033[90m" + ("-" * w) + "\033[0m")
@@ -1419,7 +1466,8 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
                 print(colored_row)
 
         if total_sessions > page_size:
-            print(f"     \033[90m... Showing {scroll_offset+1}-{min(scroll_offset+page_size, total_sessions)} of {total_sessions} sessions ...\033[0m")
+            print(
+                f"     \033[90m... Showing {scroll_offset+1}-{min(scroll_offset+page_size, total_sessions)} of {total_sessions} sessions ...\033[0m")
         else:
             print()
         print("\033[90m" + ("-" * w) + "\033[0m")
@@ -1436,9 +1484,11 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
         btn_count = len(selected_set)
         btn_text = f"  >>> [ Confirm & Migrate ({btn_count} selected) ] <<<  "
         if is_confirm_cur:
-            print(f"\033[1;32;7m{btn_text}\033[0m   \033[90m(Press Enter to execute)\033[0m")
+            print(
+                f"\033[1;32;7m{btn_text}\033[0m   \033[90m(Press Enter to execute)\033[0m")
         else:
-            print(f"\033[1;32m{btn_text}\033[0m   \033[90m(or press 'c' anytime to confirm)\033[0m")
+            print(
+                f"\033[1;32m{btn_text}\033[0m   \033[90m(or press 'c' anytime to confirm)\033[0m")
 
         sys.stdout.flush()
         k = get_key()
@@ -1511,10 +1561,14 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
 # Main Execution Orchestrator
 # ---------------------------------------------------------------------------
 
+
 def run_migration():
-    parser = argparse.ArgumentParser(description="Antigravity Session Migrator: CLI <-> Desktop")
-    parser.add_argument('--cli-dir', help="Custom path to ~/.gemini/antigravity-cli")
-    parser.add_argument('--app-dir', help="Custom path to ~/.gemini/antigravity")
+    parser = argparse.ArgumentParser(
+        description="Antigravity Session Migrator: CLI -> Desktop")
+    parser.add_argument(
+        '--cli-dir', help="Custom path to ~/.gemini/antigravity-cli")
+    parser.add_argument(
+        '--app-dir', help="Custom path to ~/.gemini/antigravity")
     parser.add_argument('--config-dir', help="Custom path to ~/.gemini/config")
     args = parser.parse_args()
 
@@ -1525,7 +1579,7 @@ def run_migration():
 
     init_terminal()
 
-    # Startup check: verify both Antigravity CLI and Desktop installations exist
+    # Startup check 1: verify both Antigravity CLI and Desktop installations exist
     problems = check_installations(cli_dir, app_dir, config_dir)
     if problems:
         cols, _ = get_terminal_size()
@@ -1537,16 +1591,26 @@ def run_migration():
         print("Both Antigravity CLI and Antigravity Desktop must be installed to migrate sessions:\n")
         for p in problems:
             print(f"  \033[1;31m*\033[0m {p}")
-        print(f"\n\033[90mPlease ensure both environments are set up before running this migrator.\033[0m\n")
+        print(
+            f"\n\033[90mPlease ensure both environments are set up before running this migrator.\033[0m\n")
         sys.exit(1)
+
+    # Startup check 2: Antigravity Desktop must be running
+    hub = detect_live_hub(app_dir)
+    while not hub:
+        action = prompt_desktop_not_running()
+        if action == 'QUIT':
+            print("\nMigration cancelled.")
+            sys.exit(0)
+        hub = detect_live_hub(app_dir)
 
     projects = discover_projects(config_dir)
     if not projects:
-        print(f"\033[1;31mError: No Antigravity projects found in {config_dir}/projects/\033[0m")
+        print(
+            f"\033[1;31mError: No Antigravity projects found in {config_dir}/projects/\033[0m")
         sys.exit(1)
 
     # Initial cursor positions
-    current_source_idx = 1
     current_project_idx = 1
     cwd = os.getcwd().replace('\\', '/').lower()
     for idx, p in enumerate(projects):
@@ -1554,84 +1618,54 @@ def run_migration():
             current_project_idx = idx + 1
             break
 
-    selected_source = None
     target_project = None
     selected_sessions = []
     step = 1
 
     while True:
         if step == 1:
-            try:
-                hide_cursor()
-                source_res, current_source_idx = select_source_screen(initial_idx=current_source_idx)
-            finally:
-                show_cursor()
-
-            if source_res in (None, 'QUIT'):
-                print("\nMigration cancelled.")
-                sys.exit(0)
-
-            # Option A: Migrating into Desktop requires Desktop to be open
-            if source_res == SRC_CLI:
-                hub = detect_live_hub(app_dir)
-                if not hub:
-                    prompt_desktop_not_running()
-                    step = 1
-                    continue
-
-            selected_source = source_res
-            step = 2
-            continue
-
-        elif step == 2:
-            src_dir = cli_dir if selected_source == SRC_CLI else app_dir
-            dst_dir = app_dir if selected_source == SRC_CLI else cli_dir
-            direction = TO_DESKTOP if selected_source == SRC_CLI else TO_CLI
-
-            # Recalculate session counts for projects using chosen source store
-            temp_sessions = discover_sessions(src_dir, dst_dir, projects[0]['id'] if projects else '', direction=direction)
+            # Recalculate session counts for projects using CLI store
+            temp_sessions = discover_sessions(
+                cli_dir, app_dir, projects[0]['id'] if projects else '')
             for p in projects:
-                p['session_count'] = sum(1 for s in temp_sessions if is_session_for_project(s, p))
+                p['session_count'] = sum(
+                    1 for s in temp_sessions if is_session_for_project(s, p))
 
             try:
                 hide_cursor()
-                proj_res, current_project_idx = select_project_screen(projects, direction=direction, initial_idx=current_project_idx)
+                proj_res, current_project_idx = select_project_screen(
+                    projects, initial_idx=current_project_idx)
             finally:
                 show_cursor()
 
-            if proj_res == 'BACK':
-                step = 1
-                continue
             if proj_res in (None, 'QUIT'):
                 print("\nMigration cancelled.")
                 sys.exit(0)
 
             target_project = proj_res
-            step = 3
+            step = 2
             continue
 
-        elif step == 3:
-            src_dir = cli_dir if selected_source == SRC_CLI else app_dir
-            dst_dir = app_dir if selected_source == SRC_CLI else cli_dir
-            direction = TO_DESKTOP if selected_source == SRC_CLI else TO_CLI
-
-            sessions = discover_sessions(src_dir, dst_dir, target_project['id'], direction=direction)
+        elif step == 2:
+            sessions = discover_sessions(
+                cli_dir, app_dir, target_project['id'])
             if not sessions:
                 clear_screen()
-                print(f"\n\033[1;33mNo sessions found to migrate in {src_dir}.\033[0m")
+                print(
+                    f"\n\033[1;33mNo sessions found to migrate in {cli_dir}.\033[0m")
                 print("\nPress any key to return to project selection...")
                 get_key()
-                step = 2
+                step = 1
                 continue
 
             try:
                 hide_cursor()
-                sess_res = select_sessions_screen(sessions, target_project, direction=direction)
+                sess_res = select_sessions_screen(sessions, target_project)
             finally:
                 show_cursor()
 
             if sess_res == 'BACK':
-                step = 2
+                step = 1
                 continue
             if sess_res in (None, 'QUIT'):
                 print("\nMigration cancelled.")
@@ -1640,34 +1674,37 @@ def run_migration():
                 print("\nNo sessions selected. Migration cancelled.")
                 sys.exit(0)
 
-            # Option A: Double check Desktop is still running before executing migration to Desktop
-            if direction == TO_DESKTOP and not detect_live_hub(dst_dir):
-                prompt_desktop_not_running()
-                step = 1
+            # Double check Desktop is still running before executing migration
+            hub = detect_live_hub(app_dir)
+            while not hub:
+                action = prompt_desktop_not_running()
+                if action == 'QUIT':
+                    step = 1
+                    break
+                hub = detect_live_hub(app_dir)
+            if not hub:
                 continue
 
             selected_sessions = sess_res
             break
 
     # -----------------------------------------------------------------------
-    # Step 4: Execute Migration
+    # Step 3: Execute Migration
     # -----------------------------------------------------------------------
     clear_screen()
-    direction = TO_DESKTOP if selected_source == SRC_CLI else TO_CLI
-    print(f"\033[1;36m========================================================================")
-    print(f"             Migrating Selected Sessions to {target_project['name']}             ")
-    print(f"  Direction: {direction_label(direction)}")
-    print(f"========================================================================\033[0m\n")
+    print(
+        f"\033[1;36m========================================================================")
+    print(
+        f"             Migrating Selected Sessions to {target_project['name']}             ")
+    print(
+        f"========================================================================\033[0m\n")
 
-    hub = None
-    if direction == TO_DESKTOP:
-        hub = detect_live_hub(dst_dir)
-        if hub:
-            print(f"\033[1;32m[OK] Antigravity Desktop Live Language Server detected (Port {hub['httpPort']}, PID {hub['pid']})\033[0m")
-            print(f"\033[90m     Sessions will be injected live into the desktop sidebar immediately.\033[0m\n")
-    else:
-        print(f"\033[1;36m[*] Target is Antigravity CLI.\033[0m")
-        print(f"\033[90m    Note: Close any running 'agy' interactive sessions to prevent database locks.\033[0m\n")
+    hub = detect_live_hub(app_dir)
+    if hub:
+        print(
+            f"\033[1;32m[OK] Antigravity Desktop Live Language Server detected (Port {hub['httpPort']}, PID {hub['pid']})\033[0m")
+        print(
+            f"\033[90m     Sessions will be injected live into the desktop sidebar immediately.\033[0m\n")
 
     success_count = 0
     total_to_migrate = len(selected_sessions)
@@ -1677,36 +1714,40 @@ def run_migration():
         title = s['title']
         subagents = s['subagents']
         all_ids = [cid] + subagents
-        id_map = {k: map_cid(k, direction) for k in all_ids}
+        id_map = {k: map_cid(k) for k in all_ids}
 
         sub_info = f" (+ {len(subagents)} subagents)" if subagents else ""
         print(f"[{idx}/{total_to_migrate}] Migrating \033[1m\"{s['clean_title']}\"\033[0m{sub_info} ...", end=" ", flush=True)
 
         try:
-            migrate_single_session(cid, src_dir, dst_dir, target_project, hub=hub, title=title, id_map=id_map, direction=direction)
+            migrate_single_session(
+                cid, cli_dir, app_dir, target_project, hub=hub, title=title, id_map=id_map)
             for sub_id in subagents:
-                migrate_single_session(sub_id, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=direction)
+                migrate_single_session(
+                    sub_id, cli_dir, app_dir, target_project, hub=hub, id_map=id_map)
 
-            sync_session_summaries(s, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=direction)
+            sync_session_summaries(s, cli_dir, app_dir,
+                                   target_project, hub=hub, id_map=id_map)
             print("\033[1;32mDone\033[0m")
             success_count += 1
         except Exception as e:
             print(f"\033[1;31mFailed: {e}\033[0m")
 
-    print(f"\n\033[1;32m========================================================================")
-    print(f" Migration Complete: {success_count}/{total_to_migrate} sessions successfully migrated! ")
-    print(f"========================================================================\033[0m\n")
-    print(f"Target Project: \033[1m{target_project['name']}\033[0m ({target_project['id']})")
-    if direction == TO_DESKTOP:
-        print("Open any migrated session directly in Antigravity Desktop:")
-        for s in selected_sessions:
-            d_cid = s.get('desktop_cid') or map_cid(s['conversation_id'], direction)
-            print(f" - {s['title']}: conversation://{d_cid}")
-    else:
-        print(f"Sessions migrated to Antigravity CLI in {dst_dir}.")
-        print("You can resume them using `agy` in your project workspace.")
-    src_name = "Antigravity CLI" if direction == TO_DESKTOP else "Antigravity Desktop"
-    print(f"\n\033[90mAll original files in {src_name} ({src_dir}) remain 100% intact.\033[0m\n")
+    print(
+        f"\n\033[1;32m========================================================================")
+    print(
+        f" Migration Complete: {success_count}/{total_to_migrate} sessions successfully migrated! ")
+    print(
+        f"========================================================================\033[0m\n")
+    print(
+        f"Target Project: \033[1m{target_project['name']}\033[0m ({target_project['id']})")
+    print("Open any migrated session directly in Antigravity Desktop:")
+    for s in selected_sessions:
+        d_cid = s.get('desktop_cid') or map_cid(s['conversation_id'])
+        print(f" - {s['title']}: conversation://{d_cid}")
+    print(
+        f"\n\033[90mAll original files in Antigravity CLI ({cli_dir}) remain 100% intact.\033[0m\n")
+
 
 if __name__ == '__main__':
     try:
