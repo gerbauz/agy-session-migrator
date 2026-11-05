@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Antigravity CLI -> Desktop 2.0 Session Migrator
-===============================================
-A universal, zero-dependency interactive CLI tool to list and migrate Antigravity CLI
-(`agy`) conversation sessions into the Antigravity 2.0 Desktop UI.
+Antigravity Session Migrator: CLI <-> Desktop
+=============================================
+A universal, zero-dependency interactive tool to migrate conversation sessions between
+Antigravity CLI (`agy`) and Antigravity Desktop, in either direction.
 
 Features:
 - Pure Python 3 standard library (zero external dependencies).
 - Cross-platform interactive TUI (Windows msvcrt / Unix termios).
-- Arrow key navigation & Enter to select target project (Step 1).
-- Automatic filtering: selecting a project shows only sessions belonging to that project's workspace, with 'f' to toggle all.
-- Arrow key navigation, Space to toggle, 'a' to select all, and Enter to migrate (Step 2).
-- Dedicated "< Back to Project Selection" button and [Esc] shortcut to return to Step 1.
-- Pixel-perfect, fixed-width columnar alignment across all titles, subagents, step counts, dates, and status tags.
-- Automatic filtering of corrupt/ghost uninitialized sessions.
+- Startup check: both Antigravity CLI and Antigravity Desktop must be installed.
+- Step 1: pick the migration target (Antigravity Desktop or Antigravity CLI).
+- Step 2: pick the target project.
+- Step 3: pick sessions (Space to toggle, 'a' all, 'f' project filter, Enter/c to migrate).
+- Uniform navigation: [Esc] or the "< Back" button returns to the previous step; on Step 1 it exits.
+- Automatic filtering of corrupt/ghost uninitialized sessions and of sessions that were
+  themselves migrated from the other side (prevents ping-pong copies).
 - Automatic bundling of child subagent trajectories with their parent sessions.
-- Dual-mode sync: Live RPC when Antigravity 2.0 is running, or direct SQLite/Protobuf sync when offline.
-- 100% non-destructive: Original files in ~/.gemini/antigravity-cli are never modified or deleted.
+- Desktop target: Live RPC when Antigravity Desktop is running, or direct SQLite/Protobuf sync when offline.
+- CLI target: direct SQLite/file sync.
+- 100% non-destructive: source session files are never modified or deleted.
 """
 
 import os
@@ -48,6 +50,24 @@ def get_desktop_cid(cli_cid):
     untouched while ensuring the Desktop copy is exclusively owned by watcher #1 (source = 0).
     """
     return str(uuid.uuid5(uuid.NAMESPACE_OID, f"antigravity-desktop:{cli_cid}"))
+
+def get_cli_cid(desktop_cid):
+    """Deterministically map a Desktop conversation UUID to a dedicated CLI conversation UUID."""
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, f"antigravity-cli:{desktop_cid}"))
+
+# Migration directions (named after the TARGET)
+TO_DESKTOP = 'desktop'
+TO_CLI = 'cli'
+CLI_SOURCE_ENUM = 17          # CORTEX_TRAJECTORY_SOURCE_CLI
+CLI_SOURCE_NAME = 'CORTEX_TRAJECTORY_SOURCE_CLI'
+
+def map_cid(cid, direction):
+    return get_desktop_cid(cid) if direction == TO_DESKTOP else get_cli_cid(cid)
+
+def direction_label(direction):
+    if direction == TO_DESKTOP:
+        return 'Antigravity CLI -> Antigravity Desktop'
+    return 'Antigravity Desktop -> Antigravity CLI'
 
 # ---------------------------------------------------------------------------
 # Cross-Platform Terminal & Keypress Handling
@@ -322,9 +342,33 @@ def discover_projects(config_dir):
     projects.sort(key=lambda p: p['name'].lower())
     return projects
 
-def discover_cli_sessions(cli_dir, app_dir, target_project_id):
-    """Load all valid sessions from the CLI directory, grouping subagents under root parents."""
-    sum_db = os.path.join(cli_dir, 'conversation_summaries.db')
+def check_installations(cli_dir, app_dir, config_dir):
+    """Return a list of human-readable problems; empty list means both installs are usable."""
+    problems = []
+    for name, d in (('Antigravity CLI', cli_dir), ('Antigravity Desktop', app_dir)):
+        if not os.path.isdir(d):
+            problems.append(f"{name} not found ({d})")
+        elif not os.path.exists(os.path.join(d, 'conversation_summaries.db')):
+            problems.append(f"{name} has no session database ({os.path.join(d, 'conversation_summaries.db')})")
+    if not discover_projects(config_dir):
+        problems.append(f"No Antigravity projects found ({os.path.join(config_dir, 'projects')})")
+    return problems
+
+def _read_cids(sum_db):
+    if not os.path.exists(sum_db):
+        return set()
+    try:
+        con = sqlite3.connect(sum_db)
+        try:
+            return {r[0] for r in con.execute('SELECT conversation_id FROM conversation_summaries')}
+        finally:
+            con.close()
+    except Exception:
+        return set()
+
+def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP):
+    """Load all valid root sessions from src_dir, grouping subagents under root parents."""
+    sum_db = os.path.join(src_dir, 'conversation_summaries.db')
     if not os.path.exists(sum_db):
         return []
 
@@ -338,9 +382,13 @@ def discover_cli_sessions(cli_dir, app_dir, target_project_id):
         all_sessions.append(d)
     con.close()
 
-    # Query app summaries to check what's already migrated
+    # Sessions in src that are copies of sessions from dst (migrated earlier the other way)
+    back_map = get_cli_cid if direction == TO_DESKTOP else get_desktop_cid
+    foreign_copies = {back_map(x) for x in _read_cids(os.path.join(dst_dir, 'conversation_summaries.db'))}
+
+    # Query destination summaries to check what's already migrated
     app_migrated_map = {}
-    app_sum_db = os.path.join(app_dir, 'conversation_summaries.db')
+    app_sum_db = os.path.join(dst_dir, 'conversation_summaries.db')
     if os.path.exists(app_sum_db):
         try:
             acon = sqlite3.connect(app_sum_db)
@@ -377,11 +425,14 @@ def discover_cli_sessions(cli_dir, app_dir, target_project_id):
             # FILTER OUT GHOST / CORRUPTED EMPTY SESSIONS
             if (step_count == 0 and not raw_title.strip() and not raw_preview.strip()) or mod_time.startswith('0001'):
                 continue
+            # Skip CLI-watcher mirrors inside the Desktop store and copies migrated from the other side
+            if (s.get('source') or '') == CLI_SOURCE_NAME or cid in foreign_copies:
+                continue
 
-            # Determine migration status (check deterministic desktop_cid or native cid in app_dir/conversations)
-            d_cid = get_desktop_cid(cid)
-            app_conv_db = os.path.join(app_dir, 'conversations', f'{d_cid}.db')
-            native_conv_db = os.path.join(app_dir, 'conversations', f'{cid}.db')
+            # Determine migration status (check deterministic mapped cid or native cid in dst_dir/conversations)
+            d_cid = map_cid(cid, direction)
+            app_conv_db = os.path.join(dst_dir, 'conversations', f'{d_cid}.db')
+            native_conv_db = os.path.join(dst_dir, 'conversations', f'{cid}.db')
             app_info = app_migrated_map.get(d_cid) or app_migrated_map.get(cid)
             has_desktop_db = os.path.exists(app_conv_db) or (os.path.exists(native_conv_db) and app_info and app_info['source'] != 'CORTEX_TRAJECTORY_SOURCE_CLI')
             if has_desktop_db and app_info and app_info['source'] != 'CORTEX_TRAJECTORY_SOURCE_CLI':
@@ -396,7 +447,7 @@ def discover_cli_sessions(cli_dir, app_dir, target_project_id):
 
             # Load title from annotation if title is empty
             title = raw_title
-            for ann_base, check_id in ((cli_dir, cid), (app_dir, d_cid), (app_dir, cid)):
+            for ann_base, check_id in ((src_dir, cid), (dst_dir, d_cid), (dst_dir, cid)):
                 if title:
                     break
                 ann_path = os.path.join(ann_base, 'annotations', f'{check_id}.pbtxt')
@@ -599,13 +650,13 @@ def replace_uuids_in_bytes(blob, byte_id_map):
             res = res.replace(old_b, new_b)
     return res
 
-def migrate_single_session(cid, cli_dir, app_dir, target_project, hub=None, title=None, id_map=None):
-    """Migrate a single conversation ID into app_dir using its deterministic Desktop UUID."""
-    d_cid = (id_map or {}).get(cid) or get_desktop_cid(cid)
+def migrate_single_session(cid, src_dir, dst_dir, target_project, hub=None, title=None, id_map=None, direction=TO_DESKTOP):
+    """Migrate a single conversation ID from src_dir into dst_dir using its deterministic mapped UUID."""
+    d_cid = (id_map or {}).get(cid) or map_cid(cid, direction)
     byte_id_map = {k.encode('utf-8'): v.encode('utf-8') for k, v in (id_map or {cid: d_cid}).items()}
     # Also include brain directory path replacement if present in blobs
-    src_db = os.path.join(cli_dir, 'conversations', f'{cid}.db')
-    dst_db = os.path.join(app_dir, 'conversations', f'{d_cid}.db')
+    src_db = os.path.join(src_dir, 'conversations', f'{cid}.db')
+    dst_db = os.path.join(dst_dir, 'conversations', f'{d_cid}.db')
 
     if os.path.exists(src_db):
         os.makedirs(os.path.dirname(dst_db), exist_ok=True)
@@ -617,7 +668,8 @@ def migrate_single_session(cid, cli_dir, app_dir, target_project, hub=None, titl
     if os.path.exists(dst_db):
         con = sqlite3.connect(dst_db)
         cur = con.cursor()
-        cur.execute('UPDATE trajectory_meta SET cascade_id = ?, source = 1', (d_cid,))
+        traj_source = CLI_SOURCE_ENUM if direction == TO_CLI else 1
+        cur.execute('UPDATE trajectory_meta SET cascade_id = ?, source = ?', (d_cid, traj_source))
 
         try:
             blob_row = cur.execute('SELECT data FROM trajectory_metadata_blob WHERE id = "main"').fetchone()
@@ -685,22 +737,22 @@ def migrate_single_session(cid, cli_dir, app_dir, target_project, hub=None, titl
         except Exception:
             pass
 
-    # Clean up any legacy same-UUID copy in app_dir/conversations so it doesn't collide
-    legacy_dst_db = os.path.join(app_dir, 'conversations', f'{cid}.db')
+    # Clean up any legacy same-UUID copy in dst_dir/conversations so it doesn't collide
+    legacy_dst_db = os.path.join(dst_dir, 'conversations', f'{cid}.db')
     if d_cid != cid and os.path.exists(legacy_dst_db):
         try:
             os.remove(legacy_dst_db)
         except Exception:
             pass
 
-    src_brain = os.path.join(cli_dir, 'brain', cid)
-    dst_brain = os.path.join(app_dir, 'brain', d_cid)
+    src_brain = os.path.join(src_dir, 'brain', cid)
+    dst_brain = os.path.join(dst_dir, 'brain', d_cid)
     if os.path.exists(src_brain):
         os.makedirs(os.path.dirname(dst_brain), exist_ok=True)
         shutil.copytree(src_brain, dst_brain, dirs_exist_ok=True)
 
-    src_ann = os.path.join(cli_dir, 'annotations', f'{cid}.pbtxt')
-    dst_ann = os.path.join(app_dir, 'annotations', f'{d_cid}.pbtxt')
+    src_ann = os.path.join(src_dir, 'annotations', f'{cid}.pbtxt')
+    dst_ann = os.path.join(dst_dir, 'annotations', f'{d_cid}.pbtxt')
     if os.path.exists(src_ann):
         os.makedirs(os.path.dirname(dst_ann), exist_ok=True)
         shutil.copy2(src_ann, dst_ann)
@@ -713,8 +765,8 @@ def migrate_single_session(cid, cli_dir, app_dir, target_project, hub=None, titl
         except Exception:
             pass
 
-def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri):
-    """Clean protobuf raw_summary: strip CLI source (field 20) and update projectId (field 18)."""
+def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri, direction=TO_DESKTOP):
+    """Clean protobuf raw_summary: set/strip source (field 20) per direction and update projectId (field 18)."""
     if not raw_summary:
         return raw_summary
     try:
@@ -755,7 +807,7 @@ def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri):
                     new_meta.append((7, 2, folder_uri.encode('utf-8')))
                 new_fields.append((17, 2, serialize_fields(new_meta)))
             elif fnum == 20:
-                # Field 20 is source enum -> MUST STRIP CLI SOURCE!
+                # Field 20 is source enum -> strip for Desktop, re-added as CLI below for CLI target
                 pass
             else:
                 new_fields.append((fnum, wtype, val))
@@ -766,6 +818,9 @@ def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri):
         if not has_title_annotation:
             ann_bytes = encode_field(1, 2, title.encode('utf-8'))
             new_fields.append((15, 2, ann_bytes))
+
+        if direction == TO_CLI:
+            new_fields.append((20, 0, CLI_SOURCE_ENUM))
 
         return serialize_fields(new_fields)
     except Exception:
@@ -829,22 +884,22 @@ def update_proto_summaries_file(app_dir, cid, new_raw_summary, mtime_sec=None):
     except Exception:
         pass
 
-def sync_session_summaries(session, cli_dir, app_dir, target_project, hub=None, id_map=None):
-    """Sync summaries into Antigravity 2.0 (via live RPC or direct store write)."""
+def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, id_map=None, direction=TO_DESKTOP):
+    """Sync summaries into the target store (Desktop: live RPC or direct store write; CLI: direct write)."""
     cid = session['conversation_id']
-    d_cid = (id_map or {}).get(cid) or session.get('desktop_cid') or get_desktop_cid(cid)
+    d_cid = (id_map or {}).get(cid) or session.get('desktop_cid') or map_cid(cid, direction)
     byte_id_map = {k.encode('utf-8'): v.encode('utf-8') for k, v in (id_map or {cid: d_cid}).items()}
     title = session['title']
     preview = session['preview'] or title
     step_count = session['step_count']
 
-    cli_sum_db = os.path.join(cli_dir, 'conversation_summaries.db')
+    src_sum_db = os.path.join(src_dir, 'conversation_summaries.db')
     raw_summary = None
     last_mod = ''
     last_input_time = ''
     last_input_step = -1
-    if os.path.exists(cli_sum_db):
-        con = sqlite3.connect(cli_sum_db)
+    if os.path.exists(src_sum_db):
+        con = sqlite3.connect(src_sum_db)
         cur = con.cursor()
         r = cur.execute('SELECT raw_summary, last_modified_time, last_user_input_time, last_user_input_step_index FROM conversation_summaries WHERE conversation_id = ?', (cid,)).fetchone()
         if r:
@@ -860,10 +915,10 @@ def sync_session_summaries(session, cli_dir, app_dir, target_project, hub=None, 
     else:
         ws_uri_json = json.dumps([ws_uri])
 
-    dst_db = os.path.join(app_dir, 'conversations', f'{d_cid}.db')
+    dst_db = os.path.join(dst_dir, 'conversations', f'{d_cid}.db')
     mtime_sec = int(os.path.getmtime(dst_db)) if os.path.exists(dst_db) else int(time.time())
 
-    if hub:
+    if hub and direction == TO_DESKTOP:
         # Allow fsnotify (handleEvent) in language_server.exe to process the dst_db write
         # and record Store.fileModTimes[d_cid] = mtime(dst_db) in memory BEFORE we write
         # the canonical summary and title via RPC.
@@ -899,11 +954,11 @@ def sync_session_summaries(session, cli_dir, app_dir, target_project, hub=None, 
         rpc_update_annotations(hub, d_cid, title)
 
     # Clean and update raw protobuf summary (strip CLI source, update projectId, replace cid -> d_cid)
-    new_raw_summary = clean_and_update_raw_summary(raw_summary, title, target_project['id'], folder_uri)
+    new_raw_summary = clean_and_update_raw_summary(raw_summary, title, target_project['id'], folder_uri, direction)
     new_raw_summary = replace_uuids_in_bytes(new_raw_summary, byte_id_map)
 
     # Update backing SQLite DB
-    app_sum_db = os.path.join(app_dir, 'conversation_summaries.db')
+    app_sum_db = os.path.join(dst_dir, 'conversation_summaries.db')
     if os.path.exists(app_sum_db):
         con = sqlite3.connect(app_sum_db)
         cur = con.cursor()
@@ -934,16 +989,100 @@ def sync_session_summaries(session, cli_dir, app_dir, target_project, hub=None, 
         con.close()
 
     # Update agyhub_summaries_proto.pb directly (preserving file_mod_times)
-    update_proto_summaries_file(app_dir, d_cid, new_raw_summary, mtime_sec=mtime_sec)
+    if direction == TO_DESKTOP:
+        update_proto_summaries_file(dst_dir, d_cid, new_raw_summary, mtime_sec=mtime_sec)
 
 # ---------------------------------------------------------------------------
 # Interactive TUI Screens
 # ---------------------------------------------------------------------------
 
-def select_project_screen(projects, initial_idx=0):
-    """Screen 1: Select target project via arrow keys and Enter. Esc or q closes."""
-    cursor_idx = max(0, min(initial_idx, len(projects) - 1))
+def select_target_screen(initial_idx=1):
+    """
+    Screen 1: Select migration target (Antigravity Desktop or Antigravity CLI).
+    Row 0: < Exit
+    Row 1: Antigravity Desktop
+    Row 2: Antigravity CLI
+    """
+    targets = [
+        {
+            'id': TO_DESKTOP,
+            'name': 'Antigravity Desktop',
+            'desc': 'Migrate sessions from Antigravity CLI -> Antigravity Desktop'
+        },
+        {
+            'id': TO_CLI,
+            'name': 'Antigravity CLI',
+            'desc': 'Migrate sessions from Antigravity Desktop -> Antigravity CLI'
+        }
+    ]
+    cursor_idx = max(0, min(initial_idx, 2))
+    total_rows = 3  # 0: Exit, 1: Desktop, 2: CLI
+
+    while True:
+        clear_screen()
+        cols, rows = get_terminal_size()
+        w = max(88, min(cols, 105))
+        border = '=' * w
+
+        print(f"\033[1;36m{border}")
+        print(f"             Antigravity Session Migrator: CLI <-> Desktop             ")
+        print(f"{border}\033[0m")
+        print("\n\033[1mStep 1: Select Migration Target\033[0m")
+        print("\033[90mUse [Up/Down] arrows to navigate, [Enter] to select, [Esc/q] to exit\033[0m\n")
+
+        # Row 0: Exit Button
+        is_exit_cur = (cursor_idx == 0)
+        exit_text = "  < Exit Application  "
+        if is_exit_cur:
+            print(f"\033[1;31;7m[ {exit_text} ]\033[0m   \033[90m(Press Enter or Esc to exit)\033[0m")
+        else:
+            print(f"\033[31m[ {exit_text} ]\033[0m")
+        print("\033[90m" + ("-" * w) + "\033[0m")
+
+        for idx, t in enumerate(targets, 1):
+            is_cur = (idx == cursor_idx)
+            ptr = "\033[1;36m>\033[0m " if is_cur else "  "
+            name_str = t['name'][:22].ljust(22)
+            desc_str = f"({t['desc']})"
+            line = f"{ptr}\033[1m{name_str}\033[0m \033[90m{desc_str}\033[0m"
+            plain_line = f"{ptr}{name_str} {desc_str}"
+
+            if is_cur:
+                print(f"\033[7m{plain_line}\033[0m")
+            else:
+                print(line)
+
+        print("\033[90m" + ("-" * w) + "\033[0m")
+        sys.stdout.flush()
+
+        k = get_key()
+        if k in ('UP', 'k'):
+            cursor_idx = (cursor_idx - 1) % total_rows
+        elif k in ('DOWN', 'j'):
+            cursor_idx = (cursor_idx + 1) % total_rows
+        elif k in ('ESC', 'b', 'LEFT'):
+            return 'QUIT', cursor_idx
+        elif k in ('q', 'CTRL_C'):
+            return 'QUIT', cursor_idx
+        elif k == 'HOME':
+            cursor_idx = 0
+        elif k == 'END':
+            cursor_idx = total_rows - 1
+        elif k == 'ENTER':
+            if cursor_idx == 0:
+                return 'QUIT', cursor_idx
+            return targets[cursor_idx - 1]['id'], cursor_idx
+
+def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
+    """
+    Screen 2: Select target project via arrow keys and Enter.
+    Row 0: < Back to Target Selection
+    Rows 1..N: projects
+    Esc/b returns to Step 1, q quits.
+    """
     total = len(projects)
+    total_rows = total + 1
+    cursor_idx = max(0, min(initial_idx, total_rows - 1))
     page_size = 14
     scroll_offset = 0
 
@@ -954,20 +1093,34 @@ def select_project_screen(projects, initial_idx=0):
         border = '=' * w
 
         print(f"\033[1;36m{border}")
-        print(f"             Antigravity CLI -> Desktop 2.0 Session Migrator            ")
+        print(f"             Antigravity Session Migrator: CLI <-> Desktop             ")
+        print(f"  Direction: \033[1;32m{direction_label(direction)}\033[0m")
         print(f"{border}\033[0m")
-        print("\n\033[1mStep 1: Select Target Desktop Project\033[0m")
-        print("\033[90mUse [Up/Down] arrows to navigate, [Enter] to select, [Esc/q] to exit\033[0m\n")
+        print("\n\033[1mStep 2: Select Target Project\033[0m")
+        print("\033[90mUse [Up/Down] arrows to navigate, [Enter] to select, [Esc/b] to go back, [q] to exit\033[0m\n")
 
-        if cursor_idx < scroll_offset:
-            scroll_offset = cursor_idx
-        elif cursor_idx >= scroll_offset + page_size:
-            scroll_offset = cursor_idx - page_size + 1
+        # Row 0: Back Button
+        is_back_cur = (cursor_idx == 0)
+        back_text = "  < Back to Target Selection  "
+        if is_back_cur:
+            print(f"\033[1;33;7m[ {back_text} ]\033[0m   \033[90m(Press Enter or Esc to change target)\033[0m")
+        else:
+            print(f"\033[33m[ {back_text} ]\033[0m")
+        print("\033[90m" + ("-" * w) + "\033[0m")
+
+        if cursor_idx >= 1:
+            proj_idx = cursor_idx - 1
+            if proj_idx < scroll_offset:
+                scroll_offset = proj_idx
+            elif proj_idx >= scroll_offset + page_size:
+                scroll_offset = proj_idx - page_size + 1
+
         visible_projects = projects[scroll_offset:scroll_offset + page_size]
 
         for rel_idx, p in enumerate(visible_projects):
-            idx = scroll_offset + rel_idx
-            is_cur = (idx == cursor_idx)
+            actual_idx = scroll_offset + rel_idx
+            row_idx = actual_idx + 1
+            is_cur = (row_idx == cursor_idx)
             ptr = "\033[1;36m>\033[0m " if is_cur else "  "
             
             p_name = p['name'][:20].ljust(20)
@@ -985,30 +1138,42 @@ def select_project_screen(projects, initial_idx=0):
         if total > page_size:
             print(f"\n  \033[90m... Showing {scroll_offset+1}-{min(scroll_offset+page_size, total)} of {total} projects ...\033[0m")
 
+        print("\033[90m" + ("-" * w) + "\033[0m")
         sys.stdout.flush()
+
         k = get_key()
         if k in ('UP', 'k'):
-            cursor_idx = (cursor_idx - 1) % total
+            cursor_idx = (cursor_idx - 1) % total_rows
         elif k in ('DOWN', 'j'):
-            cursor_idx = (cursor_idx + 1) % total
+            cursor_idx = (cursor_idx + 1) % total_rows
         elif k == 'PAGE_UP':
-            cursor_idx = max(0, cursor_idx - page_size)
+            if cursor_idx == 0:
+                cursor_idx = total_rows - 1
+            else:
+                cursor_idx = max(0, cursor_idx - page_size)
         elif k == 'PAGE_DOWN':
-            cursor_idx = min(total - 1, cursor_idx + page_size)
+            if cursor_idx == total_rows - 1:
+                cursor_idx = 0
+            else:
+                cursor_idx = min(total_rows - 1, cursor_idx + page_size)
         elif k == 'HOME':
             cursor_idx = 0
         elif k == 'END':
-            cursor_idx = total - 1
+            cursor_idx = total_rows - 1
+        elif k in ('ESC', 'b', 'LEFT'):
+            return 'BACK', cursor_idx
+        elif k in ('q', 'CTRL_C'):
+            return 'QUIT', cursor_idx
         elif k == 'ENTER':
-            return projects[cursor_idx], cursor_idx
-        elif k in ('ESC', 'q', 'CTRL_C'):
-            return None, cursor_idx
+            if cursor_idx == 0:
+                return 'BACK', cursor_idx
+            return projects[cursor_idx - 1], cursor_idx
 
-def select_sessions_screen(all_sessions, target_project):
+def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
     """
-    Screen 2: Select sessions to migrate.
+    Screen 3: Select sessions to migrate.
     Columns are fixed-width padded and aligned.
-    Esc returns to Step 1, q quits.
+    Esc returns to Step 2, q quits.
     'f' toggles filtering by selected project.
     """
     BACK_IDX = 0
@@ -1050,11 +1215,11 @@ def select_sessions_screen(all_sessions, target_project):
             filter_note = f"Showing all {len(all_sessions)} sessions - press 'f' to filter"
 
         print(f"\033[1;36m{border}")
-        print(f"  Target Project: \033[1;32m{target_project['name']}\033[0m \033[90m({target_project['id']})\033[0m")
+        print(f"  Target Project: \033[1;32m{target_project['name']}\033[0m \033[90m({target_project['id']})\033[0m | Direction: \033[1;36m{direction_label(direction)}\033[0m")
         print(f"  \033[90m[{filter_note}]\033[0m")
         print(f"{border}\033[0m")
-        print("\n\033[1mStep 2: Select Sessions to Migrate\033[0m")
-        print("\033[90m[Up/Down] Navigate | [Space/Enter] Toggle | [a] All | [f] Filter | [Esc] Back | [q] Quit\033[0m\n")
+        print("\n\033[1mStep 3: Select Sessions to Migrate\033[0m")
+        print("\033[90m[Up/Down] Navigate | [Space/Enter] Toggle | [a] All | [f] Filter | [Esc/b] Back | [q] Quit\033[0m\n")
 
         # ----------------- Row 0: Back Button -----------------
         is_back_cur = (cursor_idx == BACK_IDX)
@@ -1167,10 +1332,7 @@ def select_sessions_screen(all_sessions, target_project):
             cursor_idx = (cursor_idx - 1) % total_rows
         elif k in ('DOWN', 'j'):
             cursor_idx = (cursor_idx + 1) % total_rows
-        elif k == 'ESC':
-            # Esc returns to Step 1
-            return 'BACK'
-        elif k in ('LEFT', 'b'):
+        elif k in ('ESC', 'LEFT', 'b'):
             # Instant Back
             return 'BACK'
         elif k in ('q', 'CTRL_C'):
@@ -1235,10 +1397,7 @@ def select_sessions_screen(all_sessions, target_project):
 # ---------------------------------------------------------------------------
 
 def run_migration():
-    parser = argparse.ArgumentParser(description="Antigravity CLI -> Desktop 2.0 Session Migrator")
-    parser.add_argument('--project', help="Target Desktop Project ID or Name (skips Step 1)")
-    parser.add_argument('--all', action='store_true', help="Migrate all sessions without interactive prompt")
-    parser.add_argument('--list', action='store_true', help="List existing CLI sessions non-interactively")
+    parser = argparse.ArgumentParser(description="Antigravity Session Migrator: CLI <-> Desktop")
     parser.add_argument('--cli-dir', help="Custom path to ~/.gemini/antigravity-cli")
     parser.add_argument('--app-dir', help="Custom path to ~/.gemini/antigravity")
     parser.add_argument('--config-dir', help="Custom path to ~/.gemini/config")
@@ -1249,123 +1408,137 @@ def run_migration():
     app_dir = os.path.abspath(args.app_dir or default_app)
     config_dir = os.path.abspath(args.config_dir or default_config)
 
-    if not os.path.exists(cli_dir):
-        print(f"\033[1;31mError: Antigravity CLI directory not found at: {cli_dir}\033[0m")
-        sys.exit(1)
-
     init_terminal()
 
-    # Discover projects
-    projects = discover_projects(config_dir)
-    if not projects:
-        print(f"\033[1;31mError: No Antigravity 2.0 projects found in {config_dir}/projects/\033[0m")
+    # Startup check: verify both Antigravity CLI and Desktop installations exist
+    problems = check_installations(cli_dir, app_dir, config_dir)
+    if problems:
+        cols, _ = get_terminal_size()
+        w = max(88, min(cols, 105))
+        border = '=' * w
+        print(f"\033[1;31m{border}")
+        print(" [!] Missing Installation / Configuration")
+        print(f"{border}\033[0m\n")
+        print("Both Antigravity CLI and Antigravity Desktop must be installed to migrate sessions:\n")
+        for p in problems:
+            print(f"  \033[1;31m*\033[0m {p}")
+        print(f"\n\033[90mPlease ensure both environments are set up before running this migrator.\033[0m\n")
         sys.exit(1)
 
-    # Initial target project resolution from CLI flags
-    pinned_project = None
-    if args.project:
-        for p in projects:
-            if args.project.lower() in (p['id'].lower(), p['name'].lower()):
-                pinned_project = p
-                break
-        if not pinned_project:
-            print(f"\033[1;31mError: Project '{args.project}' not found.\033[0m")
-            print("Available projects:", ", ".join(p['name'] for p in projects))
-            sys.exit(1)
+    projects = discover_projects(config_dir)
+    if not projects:
+        print(f"\033[1;31mError: No Antigravity projects found in {config_dir}/projects/\033[0m")
+        sys.exit(1)
 
-    # Initial session scan to populate project counts
-    temp_pid = pinned_project['id'] if pinned_project else projects[0]['id']
-    initial_sessions = discover_cli_sessions(cli_dir, app_dir, temp_pid)
-    for p in projects:
-        p['session_count'] = sum(1 for s in initial_sessions if is_session_for_project(s, p))
-
-    # Default initial project cursor to current working directory if inside a project
-    current_project_idx = 0
+    # Initial cursor positions
+    current_target_idx = 1
+    current_project_idx = 1
     cwd = os.getcwd().replace('\\', '/').lower()
     for idx, p in enumerate(projects):
         if p['readablePath'] and p['readablePath'].lower().replace('\\', '/') == cwd:
-            current_project_idx = idx
+            current_project_idx = idx + 1
             break
 
-    # Non-interactive list mode
-    if args.list:
-        print(f"\nFound {len(initial_sessions)} valid root sessions in {cli_dir}:")
-        for idx, s in enumerate(initial_sessions, 1):
-            subs = f"(+{len(s['subagents'])} subagents)" if s['subagents'] else ""
-            print(f"[{idx:2d}] {s['conversation_id']} | {s['clean_title']:<38} {subs:<16} | {s['step_count']:>5} steps | {s['date']}")
-        sys.exit(0)
-
-    # -----------------------------------------------------------------------
-    # Interactive Navigation Loop (Step 1 <-> Step 2)
-    # -----------------------------------------------------------------------
-    target_project = pinned_project
+    selected_target = None
+    target_project = None
     selected_sessions = []
+    step = 1
 
     while True:
-        # Step 1: Select Project (if not pinned by command line flag)
-        if not target_project:
+        if step == 1:
             try:
                 hide_cursor()
-                res_proj, current_project_idx = select_project_screen(projects, initial_idx=current_project_idx)
+                target_res, current_target_idx = select_target_screen(initial_idx=current_target_idx)
             finally:
                 show_cursor()
 
-            if not res_proj:
+            if target_res in (None, 'QUIT'):
                 print("\nMigration cancelled.")
                 sys.exit(0)
-            target_project = res_proj
 
-        # Step 2: Load sessions and prompt selection
-        sessions = discover_cli_sessions(cli_dir, app_dir, target_project['id'])
-        if not sessions:
-            print(f"\n\033[1;33mNo sessions found in {cli_dir}.\033[0m")
-            sys.exit(0)
+            selected_target = target_res
+            step = 2
+            continue
 
-        if args.all:
-            selected_sessions = [s for s in sessions if is_session_for_project(s, target_project) and s['status'] != 'Migrated']
-            if not selected_sessions:
-                selected_sessions = [s for s in sessions if is_session_for_project(s, target_project)]
-            break
-        else:
+        elif step == 2:
+            src_dir = cli_dir if selected_target == TO_DESKTOP else app_dir
+            dst_dir = app_dir if selected_target == TO_DESKTOP else cli_dir
+
+            # Recalculate session counts for projects using chosen source store
+            temp_sessions = discover_sessions(src_dir, dst_dir, projects[0]['id'] if projects else '', direction=selected_target)
+            for p in projects:
+                p['session_count'] = sum(1 for s in temp_sessions if is_session_for_project(s, p))
+
             try:
                 hide_cursor()
-                res = select_sessions_screen(sessions, target_project)
+                proj_res, current_project_idx = select_project_screen(projects, direction=selected_target, initial_idx=current_project_idx)
             finally:
                 show_cursor()
 
-            if res == 'BACK':
-                # User hit Esc or "< Back" button
-                if pinned_project:
-                    pinned_project = None
-                target_project = None
-                continue  # Loop back to Step 1
-
-            if res in (None, 'QUIT'):
+            if proj_res == 'BACK':
+                step = 1
+                continue
+            if proj_res in (None, 'QUIT'):
                 print("\nMigration cancelled.")
                 sys.exit(0)
 
-            if not res:
+            target_project = proj_res
+            step = 3
+            continue
+
+        elif step == 3:
+            src_dir = cli_dir if selected_target == TO_DESKTOP else app_dir
+            dst_dir = app_dir if selected_target == TO_DESKTOP else cli_dir
+
+            sessions = discover_sessions(src_dir, dst_dir, target_project['id'], direction=selected_target)
+            if not sessions:
+                clear_screen()
+                print(f"\n\033[1;33mNo sessions found to migrate in {src_dir}.\033[0m")
+                print("\nPress any key to return to project selection...")
+                get_key()
+                step = 2
+                continue
+
+            try:
+                hide_cursor()
+                sess_res = select_sessions_screen(sessions, target_project, direction=selected_target)
+            finally:
+                show_cursor()
+
+            if sess_res == 'BACK':
+                step = 2
+                continue
+            if sess_res in (None, 'QUIT'):
+                print("\nMigration cancelled.")
+                sys.exit(0)
+            if not sess_res:
                 print("\nNo sessions selected. Migration cancelled.")
                 sys.exit(0)
 
-            selected_sessions = res
-            break  # Confirmed! Proceed to Step 3 (Migration execution)
+            selected_sessions = sess_res
+            break
 
     # -----------------------------------------------------------------------
-    # Step 3: Execute Migration
+    # Step 4: Execute Migration
     # -----------------------------------------------------------------------
     clear_screen()
     print(f"\033[1;36m========================================================================")
     print(f"             Migrating Selected Sessions to {target_project['name']}             ")
+    print(f"  Direction: {direction_label(selected_target)}")
     print(f"========================================================================\033[0m\n")
 
-    hub = detect_live_hub(app_dir)
-    if hub:
-        print(f"\033[1;32m[OK] Antigravity 2.0 Live Language Server detected (Port {hub['httpPort']}, PID {hub['pid']})\033[0m")
-        print(f"\033[90m     Sessions will be injected live into the desktop sidebar immediately.\033[0m\n")
+    hub = None
+    if selected_target == TO_DESKTOP:
+        hub = detect_live_hub(dst_dir)
+        if hub:
+            print(f"\033[1;32m[OK] Antigravity Desktop Live Language Server detected (Port {hub['httpPort']}, PID {hub['pid']})\033[0m")
+            print(f"\033[90m     Sessions will be injected live into the desktop sidebar immediately.\033[0m\n")
+        else:
+            print(f"\033[1;33m[!] Antigravity Desktop is offline.\033[0m")
+            print(f"\033[90m    Updating database and proto stores directly for next launch.\033[0m\n")
     else:
-        print(f"\033[1;33m[!] Antigravity 2.0 is offline.\033[0m")
-        print(f"\033[90m    Updating database and proto stores directly for next launch.\033[0m\n")
+        print(f"\033[1;36m[*] Target is Antigravity CLI.\033[0m")
+        print(f"\033[90m    Note: Close any running 'agy' interactive sessions to prevent database locks.\033[0m\n")
 
     success_count = 0
     total_to_migrate = len(selected_sessions)
@@ -1375,17 +1548,17 @@ def run_migration():
         title = s['title']
         subagents = s['subagents']
         all_ids = [cid] + subagents
-        id_map = {k: get_desktop_cid(k) for k in all_ids}
+        id_map = {k: map_cid(k, selected_target) for k in all_ids}
 
         sub_info = f" (+ {len(subagents)} subagents)" if subagents else ""
         print(f"[{idx}/{total_to_migrate}] Migrating \033[1m\"{s['clean_title']}\"\033[0m{sub_info} ...", end=" ", flush=True)
 
         try:
-            migrate_single_session(cid, cli_dir, app_dir, target_project, hub, title=title, id_map=id_map)
+            migrate_single_session(cid, src_dir, dst_dir, target_project, hub=hub, title=title, id_map=id_map, direction=selected_target)
             for sub_id in subagents:
-                migrate_single_session(sub_id, cli_dir, app_dir, target_project, hub, id_map=id_map)
+                migrate_single_session(sub_id, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=selected_target)
 
-            sync_session_summaries(s, cli_dir, app_dir, target_project, hub, id_map=id_map)
+            sync_session_summaries(s, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=selected_target)
             print("\033[1;32mDone\033[0m")
             success_count += 1
         except Exception as e:
@@ -1395,11 +1568,16 @@ def run_migration():
     print(f" Migration Complete: {success_count}/{total_to_migrate} sessions successfully migrated! ")
     print(f"========================================================================\033[0m\n")
     print(f"Target Project: \033[1m{target_project['name']}\033[0m ({target_project['id']})")
-    print("Open any migrated session directly:")
-    for s in selected_sessions:
-        d_cid = s.get('desktop_cid') or get_desktop_cid(s['conversation_id'])
-        print(f" - {s['title']}: conversation://{d_cid}")
-    print("\n\033[90mAll original files in ~/.gemini/antigravity-cli remain 100% intact.\033[0m\n")
+    if selected_target == TO_DESKTOP:
+        print("Open any migrated session directly in Antigravity Desktop:")
+        for s in selected_sessions:
+            d_cid = s.get('desktop_cid') or map_cid(s['conversation_id'], selected_target)
+            print(f" - {s['title']}: conversation://{d_cid}")
+    else:
+        print(f"Sessions migrated to Antigravity CLI in {dst_dir}.")
+        print("You can resume them using `agy` in your project workspace.")
+    src_name = "Antigravity CLI" if selected_target == TO_DESKTOP else "Antigravity Desktop"
+    print(f"\n\033[90mAll original files in {src_name} ({src_dir}) remain 100% intact.\033[0m\n")
 
 if __name__ == '__main__':
     try:
