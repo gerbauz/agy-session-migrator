@@ -9,8 +9,8 @@ Features:
 - Pure Python 3 standard library (zero external dependencies).
 - Cross-platform interactive TUI (Windows msvcrt / Unix termios).
 - Startup check: both Antigravity CLI and Antigravity Desktop must be installed.
-- Step 1: pick the migration target (Antigravity Desktop or Antigravity CLI).
-- Step 2: pick the target project.
+- Step 1: pick the migration source (Antigravity CLI or Antigravity Desktop).
+- Step 2: pick the project to browse.
 - Step 3: pick sessions (Space to toggle, 'a' all, 'f' project filter, Enter/c to migrate).
 - Uniform navigation: [Esc] or the "< Back" button returns to the previous step; on Step 1 it exits.
 - Automatic filtering of corrupt/ghost uninitialized sessions and of sessions that were
@@ -26,6 +26,7 @@ import sys
 import uuid
 import time
 import json
+import socket
 import shutil
 import sqlite3
 import argparse
@@ -54,6 +55,10 @@ def get_desktop_cid(cli_cid):
 def get_cli_cid(desktop_cid):
     """Deterministically map a Desktop conversation UUID to a dedicated CLI conversation UUID."""
     return str(uuid.uuid5(uuid.NAMESPACE_OID, f"antigravity-cli:{desktop_cid}"))
+
+# Migration sources (selected in Step 1)
+SRC_CLI = 'cli'
+SRC_DESKTOP = 'desktop'
 
 # Migration directions (named after the TARGET)
 TO_DESKTOP = 'desktop'
@@ -496,7 +501,81 @@ def discover_sessions(src_dir, dst_dir, target_project_id, direction=TO_DESKTOP)
 # Antigravity 2.0 Live RPC Client
 # ---------------------------------------------------------------------------
 
+def is_pid_running(pid):
+    """Fast check whether a process ID is currently alive cross-platform."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == 'nt':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h_proc = kernel32.OpenProcess(0x1000, False, pid)
+            if not h_proc:
+                return False
+            exit_code = ctypes.c_ulong()
+            # STILL_ACTIVE = 259
+            if kernel32.GetExitCodeProcess(h_proc, ctypes.byref(exit_code)):
+                kernel32.CloseHandle(h_proc)
+                return exit_code.value == 259
+            kernel32.CloseHandle(h_proc)
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+def is_port_listening(port, timeout=0.05):
+    """Fast probe to check if a TCP port is actively listening on localhost."""
+    if not port or port <= 0:
+        return False
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+def get_process_name(pid):
+    """Cross-platform process name lookup for a given PID."""
+    if not pid or pid <= 0:
+        return ""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h_proc = kernel32.OpenProcess(0x1000, False, pid)
+            if not h_proc:
+                return ""
+            try:
+                buf = ctypes.create_unicode_buffer(512)
+                size = wintypes.DWORD(512)
+                if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                    return buf.value.lower()
+            finally:
+                kernel32.CloseHandle(h_proc)
+        except Exception:
+            return ""
+    elif os.name == 'posix':
+        try:
+            comm = f"/proc/{pid}/comm"
+            if os.path.exists(comm):
+                with open(comm, 'r', encoding='utf-8') as f:
+                    return f.read().strip().lower()
+        except Exception:
+            pass
+    return ""
+
 def detect_live_hub(app_dir):
+    """
+    Detect running Antigravity Desktop Language Server.
+    Uses instant PID, process image, and TCP port checks before touching HTTP to prevent hanging.
+    """
     daemon_dir = os.path.join(app_dir, 'daemon')
     if not os.path.exists(daemon_dir):
         return None
@@ -506,26 +585,44 @@ def detect_live_hub(app_dir):
         return None
 
     hub_files.sort(key=lambda f: os.path.getmtime(os.path.join(daemon_dir, f)), reverse=True)
+    # Use proxy-free opener for localhost to avoid Windows system proxy discovery delays
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     for hf in hub_files:
         hpath = os.path.join(daemon_dir, hf)
         try:
             with open(hpath, 'r', encoding='utf-8') as fp:
                 data = json.load(fp)
-                http_port = data.get('httpPort')
-                csrf = data.get('csrfToken')
-                if http_port and csrf:
-                    url = f'http://127.0.0.1:{http_port}/exa.language_server_pb.LanguageServerService/GetWorkspaceInfos'
-                    req = urllib.request.Request(url, data=b'{}', headers={
-                        'Content-Type': 'application/json',
-                        'x-codeium-csrf-token': csrf
-                    })
-                    with urllib.request.urlopen(req, timeout=1.5) as resp:
-                        if resp.status == 200:
-                            return {
-                                'httpPort': http_port,
-                                'csrfToken': csrf,
-                                'pid': data.get('pid')
-                            }
+            pid = data.get('pid')
+            http_port = data.get('httpPort')
+            csrf = data.get('csrfToken')
+
+            # 1. Fast PID check (instant ~0ms): skip stale dead hub files
+            if not is_pid_running(pid):
+                continue
+
+            # 2. Process check: ignore CLI ('agy') hubs
+            proc_path = get_process_name(pid)
+            if proc_path.endswith('agy.exe') or proc_path.endswith('/agy'):
+                continue
+
+            # 3. Fast TCP port probe (instant ~0ms): skip closed ports
+            if not is_port_listening(http_port):
+                continue
+
+            if http_port and csrf:
+                url = f'http://127.0.0.1:{http_port}/exa.language_server_pb.LanguageServerService/GetWorkspaceInfos'
+                req = urllib.request.Request(url, data=b'{}', headers={
+                    'Content-Type': 'application/json',
+                    'x-codeium-csrf-token': csrf
+                })
+                with opener.open(req, timeout=1.0) as resp:
+                    if resp.status == 200:
+                        return {
+                            'httpPort': http_port,
+                            'csrfToken': csrf,
+                            'pid': pid
+                        }
         except Exception:
             continue
     return None
@@ -537,7 +634,8 @@ def rpc_write_summary(hub, cascade_id, summary_dict):
         'Content-Type': 'application/json',
         'x-codeium-csrf-token': hub['csrfToken']
     })
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=5) as resp:
         return resp.status == 200
 
 def rpc_update_annotations(hub, cascade_id, title):
@@ -551,7 +649,8 @@ def rpc_update_annotations(hub, cascade_id, title):
         'Content-Type': 'application/json',
         'x-codeium-csrf-token': hub['csrfToken']
     })
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=5) as resp:
         return resp.status == 200
 
 # ---------------------------------------------------------------------------
@@ -996,27 +1095,43 @@ def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, 
 # Interactive TUI Screens
 # ---------------------------------------------------------------------------
 
-def select_target_screen(initial_idx=1):
+def prompt_desktop_not_running():
+    """Display warning when Antigravity Desktop is not running, wait for key, return to Step 1."""
+    clear_screen()
+    cols, _ = get_terminal_size()
+    w = max(88, min(cols, 105))
+    border = '=' * w
+    print(f"\033[1;33m{border}")
+    print(" [!] Antigravity Desktop Is Not Running")
+    print(f"{border}\033[0m\n")
+    print("Migrating sessions into Antigravity Desktop requires the Desktop app to be open")
+    print("so sessions can be registered live with its language server.\n")
+    print("Please launch Antigravity Desktop, then try again.\n")
+    print("\033[90mPress any key to return to source selection...\033[0m")
+    sys.stdout.flush()
+    get_key()
+
+def select_source_screen(initial_idx=1):
     """
-    Screen 1: Select migration target (Antigravity Desktop or Antigravity CLI).
+    Screen 1: Select migration source (Antigravity CLI or Antigravity Desktop).
     Row 0: < Exit
-    Row 1: Antigravity Desktop
-    Row 2: Antigravity CLI
+    Row 1: Antigravity CLI (Migrate to Antigravity Desktop)
+    Row 2: Antigravity Desktop (Migrate to Antigravity CLI)
     """
-    targets = [
+    sources = [
         {
-            'id': TO_DESKTOP,
-            'name': 'Antigravity Desktop',
+            'id': SRC_CLI,
+            'name': 'Antigravity CLI',
             'desc': 'Migrate sessions from Antigravity CLI -> Antigravity Desktop'
         },
         {
-            'id': TO_CLI,
-            'name': 'Antigravity CLI',
+            'id': SRC_DESKTOP,
+            'name': 'Antigravity Desktop',
             'desc': 'Migrate sessions from Antigravity Desktop -> Antigravity CLI'
         }
     ]
     cursor_idx = max(0, min(initial_idx, 2))
-    total_rows = 3  # 0: Exit, 1: Desktop, 2: CLI
+    total_rows = 3  # 0: Exit, 1: CLI, 2: Desktop
 
     while True:
         clear_screen()
@@ -1027,7 +1142,7 @@ def select_target_screen(initial_idx=1):
         print(f"\033[1;36m{border}")
         print(f"             Antigravity Session Migrator: CLI <-> Desktop             ")
         print(f"{border}\033[0m")
-        print("\n\033[1mStep 1: Select Migration Target\033[0m")
+        print("\n\033[1mStep 1: Select Migration Source\033[0m")
         print("\033[90mUse [Up/Down] arrows to navigate, [Enter] to select, [Esc/q] to exit\033[0m\n")
 
         # Row 0: Exit Button
@@ -1039,11 +1154,11 @@ def select_target_screen(initial_idx=1):
             print(f"\033[31m[ {exit_text} ]\033[0m")
         print("\033[90m" + ("-" * w) + "\033[0m")
 
-        for idx, t in enumerate(targets, 1):
+        for idx, s in enumerate(sources, 1):
             is_cur = (idx == cursor_idx)
             ptr = "\033[1;36m>\033[0m " if is_cur else "  "
-            name_str = t['name'][:22].ljust(22)
-            desc_str = f"({t['desc']})"
+            name_str = s['name'][:22].ljust(22)
+            desc_str = f"({s['desc']})"
             line = f"{ptr}\033[1m{name_str}\033[0m \033[90m{desc_str}\033[0m"
             plain_line = f"{ptr}{name_str} {desc_str}"
 
@@ -1071,12 +1186,12 @@ def select_target_screen(initial_idx=1):
         elif k == 'ENTER':
             if cursor_idx == 0:
                 return 'QUIT', cursor_idx
-            return targets[cursor_idx - 1]['id'], cursor_idx
+            return sources[cursor_idx - 1]['id'], cursor_idx
 
 def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
     """
-    Screen 2: Select target project via arrow keys and Enter.
-    Row 0: < Back to Target Selection
+    Screen 2: Select source project via arrow keys and Enter.
+    Row 0: < Back to Source Selection
     Rows 1..N: projects
     Esc/b returns to Step 1, q quits.
     """
@@ -1096,14 +1211,14 @@ def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
         print(f"             Antigravity Session Migrator: CLI <-> Desktop             ")
         print(f"  Direction: \033[1;32m{direction_label(direction)}\033[0m")
         print(f"{border}\033[0m")
-        print("\n\033[1mStep 2: Select Target Project\033[0m")
+        print("\n\033[1mStep 2: Select Source Project\033[0m")
         print("\033[90mUse [Up/Down] arrows to navigate, [Enter] to select, [Esc/b] to go back, [q] to exit\033[0m\n")
 
         # Row 0: Back Button
         is_back_cur = (cursor_idx == 0)
-        back_text = "  < Back to Target Selection  "
+        back_text = "  < Back to Source Selection  "
         if is_back_cur:
-            print(f"\033[1;33;7m[ {back_text} ]\033[0m   \033[90m(Press Enter or Esc to change target)\033[0m")
+            print(f"\033[1;33;7m[ {back_text} ]\033[0m   \033[90m(Press Enter or Esc to change source)\033[0m")
         else:
             print(f"\033[33m[ {back_text} ]\033[0m")
         print("\033[90m" + ("-" * w) + "\033[0m")
@@ -1431,7 +1546,7 @@ def run_migration():
         sys.exit(1)
 
     # Initial cursor positions
-    current_target_idx = 1
+    current_source_idx = 1
     current_project_idx = 1
     cwd = os.getcwd().replace('\\', '/').lower()
     for idx, p in enumerate(projects):
@@ -1439,7 +1554,7 @@ def run_migration():
             current_project_idx = idx + 1
             break
 
-    selected_target = None
+    selected_source = None
     target_project = None
     selected_sessions = []
     step = 1
@@ -1448,30 +1563,39 @@ def run_migration():
         if step == 1:
             try:
                 hide_cursor()
-                target_res, current_target_idx = select_target_screen(initial_idx=current_target_idx)
+                source_res, current_source_idx = select_source_screen(initial_idx=current_source_idx)
             finally:
                 show_cursor()
 
-            if target_res in (None, 'QUIT'):
+            if source_res in (None, 'QUIT'):
                 print("\nMigration cancelled.")
                 sys.exit(0)
 
-            selected_target = target_res
+            # Option A: Migrating into Desktop requires Desktop to be open
+            if source_res == SRC_CLI:
+                hub = detect_live_hub(app_dir)
+                if not hub:
+                    prompt_desktop_not_running()
+                    step = 1
+                    continue
+
+            selected_source = source_res
             step = 2
             continue
 
         elif step == 2:
-            src_dir = cli_dir if selected_target == TO_DESKTOP else app_dir
-            dst_dir = app_dir if selected_target == TO_DESKTOP else cli_dir
+            src_dir = cli_dir if selected_source == SRC_CLI else app_dir
+            dst_dir = app_dir if selected_source == SRC_CLI else cli_dir
+            direction = TO_DESKTOP if selected_source == SRC_CLI else TO_CLI
 
             # Recalculate session counts for projects using chosen source store
-            temp_sessions = discover_sessions(src_dir, dst_dir, projects[0]['id'] if projects else '', direction=selected_target)
+            temp_sessions = discover_sessions(src_dir, dst_dir, projects[0]['id'] if projects else '', direction=direction)
             for p in projects:
                 p['session_count'] = sum(1 for s in temp_sessions if is_session_for_project(s, p))
 
             try:
                 hide_cursor()
-                proj_res, current_project_idx = select_project_screen(projects, direction=selected_target, initial_idx=current_project_idx)
+                proj_res, current_project_idx = select_project_screen(projects, direction=direction, initial_idx=current_project_idx)
             finally:
                 show_cursor()
 
@@ -1487,10 +1611,11 @@ def run_migration():
             continue
 
         elif step == 3:
-            src_dir = cli_dir if selected_target == TO_DESKTOP else app_dir
-            dst_dir = app_dir if selected_target == TO_DESKTOP else cli_dir
+            src_dir = cli_dir if selected_source == SRC_CLI else app_dir
+            dst_dir = app_dir if selected_source == SRC_CLI else cli_dir
+            direction = TO_DESKTOP if selected_source == SRC_CLI else TO_CLI
 
-            sessions = discover_sessions(src_dir, dst_dir, target_project['id'], direction=selected_target)
+            sessions = discover_sessions(src_dir, dst_dir, target_project['id'], direction=direction)
             if not sessions:
                 clear_screen()
                 print(f"\n\033[1;33mNo sessions found to migrate in {src_dir}.\033[0m")
@@ -1501,7 +1626,7 @@ def run_migration():
 
             try:
                 hide_cursor()
-                sess_res = select_sessions_screen(sessions, target_project, direction=selected_target)
+                sess_res = select_sessions_screen(sessions, target_project, direction=direction)
             finally:
                 show_cursor()
 
@@ -1515,6 +1640,12 @@ def run_migration():
                 print("\nNo sessions selected. Migration cancelled.")
                 sys.exit(0)
 
+            # Option A: Double check Desktop is still running before executing migration to Desktop
+            if direction == TO_DESKTOP and not detect_live_hub(dst_dir):
+                prompt_desktop_not_running()
+                step = 1
+                continue
+
             selected_sessions = sess_res
             break
 
@@ -1522,20 +1653,18 @@ def run_migration():
     # Step 4: Execute Migration
     # -----------------------------------------------------------------------
     clear_screen()
+    direction = TO_DESKTOP if selected_source == SRC_CLI else TO_CLI
     print(f"\033[1;36m========================================================================")
     print(f"             Migrating Selected Sessions to {target_project['name']}             ")
-    print(f"  Direction: {direction_label(selected_target)}")
+    print(f"  Direction: {direction_label(direction)}")
     print(f"========================================================================\033[0m\n")
 
     hub = None
-    if selected_target == TO_DESKTOP:
+    if direction == TO_DESKTOP:
         hub = detect_live_hub(dst_dir)
         if hub:
             print(f"\033[1;32m[OK] Antigravity Desktop Live Language Server detected (Port {hub['httpPort']}, PID {hub['pid']})\033[0m")
             print(f"\033[90m     Sessions will be injected live into the desktop sidebar immediately.\033[0m\n")
-        else:
-            print(f"\033[1;33m[!] Antigravity Desktop is offline.\033[0m")
-            print(f"\033[90m    Updating database and proto stores directly for next launch.\033[0m\n")
     else:
         print(f"\033[1;36m[*] Target is Antigravity CLI.\033[0m")
         print(f"\033[90m    Note: Close any running 'agy' interactive sessions to prevent database locks.\033[0m\n")
@@ -1548,17 +1677,17 @@ def run_migration():
         title = s['title']
         subagents = s['subagents']
         all_ids = [cid] + subagents
-        id_map = {k: map_cid(k, selected_target) for k in all_ids}
+        id_map = {k: map_cid(k, direction) for k in all_ids}
 
         sub_info = f" (+ {len(subagents)} subagents)" if subagents else ""
         print(f"[{idx}/{total_to_migrate}] Migrating \033[1m\"{s['clean_title']}\"\033[0m{sub_info} ...", end=" ", flush=True)
 
         try:
-            migrate_single_session(cid, src_dir, dst_dir, target_project, hub=hub, title=title, id_map=id_map, direction=selected_target)
+            migrate_single_session(cid, src_dir, dst_dir, target_project, hub=hub, title=title, id_map=id_map, direction=direction)
             for sub_id in subagents:
-                migrate_single_session(sub_id, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=selected_target)
+                migrate_single_session(sub_id, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=direction)
 
-            sync_session_summaries(s, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=selected_target)
+            sync_session_summaries(s, src_dir, dst_dir, target_project, hub=hub, id_map=id_map, direction=direction)
             print("\033[1;32mDone\033[0m")
             success_count += 1
         except Exception as e:
@@ -1568,15 +1697,15 @@ def run_migration():
     print(f" Migration Complete: {success_count}/{total_to_migrate} sessions successfully migrated! ")
     print(f"========================================================================\033[0m\n")
     print(f"Target Project: \033[1m{target_project['name']}\033[0m ({target_project['id']})")
-    if selected_target == TO_DESKTOP:
+    if direction == TO_DESKTOP:
         print("Open any migrated session directly in Antigravity Desktop:")
         for s in selected_sessions:
-            d_cid = s.get('desktop_cid') or map_cid(s['conversation_id'], selected_target)
+            d_cid = s.get('desktop_cid') or map_cid(s['conversation_id'], direction)
             print(f" - {s['title']}: conversation://{d_cid}")
     else:
         print(f"Sessions migrated to Antigravity CLI in {dst_dir}.")
         print("You can resume them using `agy` in your project workspace.")
-    src_name = "Antigravity CLI" if selected_target == TO_DESKTOP else "Antigravity Desktop"
+    src_name = "Antigravity CLI" if direction == TO_DESKTOP else "Antigravity Desktop"
     print(f"\n\033[90mAll original files in {src_name} ({src_dir}) remain 100% intact.\033[0m\n")
 
 if __name__ == '__main__':
