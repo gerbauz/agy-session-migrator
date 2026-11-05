@@ -11,7 +11,7 @@ Features:
 - Startup check: Antigravity Desktop must be running. If not, prompts user to start it
   with [Enter] to retry or [Esc/q] to quit.
 - Step 1: pick the target project.
-- Step 2: pick sessions (Space to toggle, 'a' all, 'f' project filter, Enter/c to migrate).
+- Step 2: pick sessions (Space to toggle, 'a' all, Enter/c to migrate).
 - Uniform navigation: [Esc] or the "< Back" button returns to the previous step; on Step 1 it exits.
 - Automatic filtering of corrupt/ghost uninitialized sessions.
 - Automatic bundling of child subagent trajectories with their parent sessions.
@@ -155,6 +155,8 @@ def _posix_get_key():
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
+        if not ch:
+            return 'QUIT'
         if ch == '\x1b':
             seq = ''
             while True:
@@ -484,8 +486,11 @@ def is_session_for_project(session, project):
         return True
 
     # Check workspace URIs against project folder
-    proj_path = normalize_path(project.get(
-        'readablePath') or project.get('folderUri', ''))
+    proj_path = project.get('_norm_path')
+    if proj_path is None:
+        proj_path = normalize_path(project.get(
+            'readablePath') or project.get('folderUri', ''))
+        project['_norm_path'] = proj_path
     if not proj_path:
         return False
 
@@ -542,11 +547,13 @@ def discover_projects(config_dir):
                     if len(clean_path) > 2 and clean_path[1] == ':':
                         clean_path = clean_path[0].upper() + clean_path[1:]
                     readable_path = clean_path
+                final_path = readable_path or folder_uri
                 projects.append({
                     'id': pid,
                     'name': name,
                     'folderUri': folder_uri,
-                    'readablePath': readable_path or folder_uri,
+                    'readablePath': final_path,
+                    '_norm_path': normalize_path(final_path),
                     'session_count': 0
                 })
         except Exception:
@@ -568,19 +575,6 @@ def check_installations(cli_dir, app_dir, config_dir):
         problems.append(
             f"No Antigravity projects found ({os.path.join(config_dir, 'projects')})")
     return problems
-
-
-def _read_cids(sum_db):
-    if not os.path.exists(sum_db):
-        return set()
-    try:
-        con = sqlite3.connect(sum_db)
-        try:
-            return {r[0] for r in con.execute('SELECT conversation_id FROM conversation_summaries')}
-        finally:
-            con.close()
-    except Exception:
-        return set()
 
 
 def prune_ghost_sessions(cli_dir, app_dir, project=None):
@@ -655,16 +649,17 @@ def prune_ghost_sessions(cli_dir, app_dir, project=None):
             con.close()
             return 0
 
-        # Execute safe deletion in batches
-        placeholders = ','.join(['?'] * len(ghost_cids))
-        cur.execute(
-            f'DELETE FROM conversation_summaries WHERE conversation_id IN ({placeholders})', ghost_cids)
-
-        try:
+        # Execute safe deletion in chunks of 500 to stay well under SQLite parameter limits
+        for i in range(0, len(ghost_cids), 500):
+            batch = ghost_cids[i:i + 500]
+            placeholders = ','.join(['?'] * len(batch))
             cur.execute(
-                f'DELETE FROM conversations_fts WHERE conversation_id IN ({placeholders})', ghost_cids)
-        except Exception:
-            pass
+                f'DELETE FROM conversation_summaries WHERE conversation_id IN ({placeholders})', batch)
+            try:
+                cur.execute(
+                    f'DELETE FROM conversations_fts WHERE conversation_id IN ({placeholders})', batch)
+            except Exception:
+                pass
 
         con.commit()
         con.close()
@@ -1160,8 +1155,8 @@ def migrate_single_session(cid, src_dir, dst_dir, target_project, hub=None, titl
             pass
 
 
-def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri, direction=TO_DESKTOP):
-    """Clean protobuf raw_summary: set/strip source (field 20) per direction and update projectId (field 18)."""
+def clean_and_update_raw_summary(raw_summary, title, project_id, folder_uri):
+    """Clean protobuf raw_summary: strip CLI source (field 20) for Desktop and update projectId (field 18)."""
     if not raw_summary:
         return raw_summary
     try:
@@ -1364,7 +1359,7 @@ def sync_session_summaries(session, src_dir, dst_dir, target_project, hub=None, 
 
     # Clean and update raw protobuf summary (strip CLI source, update projectId, replace cid -> d_cid)
     new_raw_summary = clean_and_update_raw_summary(
-        raw_summary, title, target_project['id'], folder_uri, direction)
+        raw_summary, title, target_project['id'], folder_uri)
     new_raw_summary = replace_uuids_in_bytes(new_raw_summary, byte_id_map)
 
     # Update backing SQLite DB
@@ -1566,15 +1561,15 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
     Step 2: Select sessions to migrate.
     Columns are fixed-width padded and aligned.
     Esc/b returns to Step 1, q quits.
-    'f' toggles filtering by selected project.
     """
     BACK_IDX = 0
     selected_set = set()
 
-    # Filter by project by default
-    matching_sessions = [
+    current_sessions = [
         s for s in all_sessions if is_session_for_project(s, target_project)]
-    filter_active = True
+    total_sessions = len(current_sessions)
+    CONFIRM_IDX = total_sessions + 1
+    total_rows = total_sessions + 2
 
     cursor_idx = 1
     page_size = 14
@@ -1582,16 +1577,6 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
     status_message = ""
 
     while True:
-        # Determine currently active session view
-        if filter_active:
-            current_sessions = matching_sessions
-        else:
-            current_sessions = all_sessions
-
-        total_sessions = len(current_sessions)
-        CONFIRM_IDX = total_sessions + 1
-        total_rows = total_sessions + 2
-
         # Ensure cursor within bounds
         if cursor_idx >= total_rows:
             cursor_idx = CONFIRM_IDX
@@ -1601,28 +1586,19 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
         w = max(88, min(cols, 110))
         border = '=' * w
 
-        # Header with Project & Filter Info
-        if filter_active and matching_sessions:
-            filter_note = (
-                f"Matching '{target_project['name']}' only "
-                f"({len(current_sessions)} sessions) - press 'f' to show all {len(all_sessions)}"
-            )
-        elif filter_active:
-            filter_note = (
-                f"Matching '{target_project['name']}' only "
-                f"(0 sessions) - press 'f' to show all {len(all_sessions)}"
-            )
-        else:
-            filter_note = f"Showing all {len(all_sessions)} sessions - press 'f' to filter"
-
-        proj_title = f"\033[1;32m{target_project['name']}\033[0m \033[90m({target_project['id']})\033[0m"
+        proj_title = (
+            f"\033[1;32m{target_project['name']}\033[0m "
+            f"\033[90m({target_project['id']})\033[0m"
+        )
+        count_note = f"{total_sessions} session{'s' if total_sessions != 1 else ''} available to migrate"
 
         print(f"\033[1;36m{border}")
         print(f"  Target Project: {proj_title}")
-        print(f"  Filter:         \033[90m[{filter_note}]\033[0m")
-        print(f"{border}\033[0m")
+        print(f"  Sessions:       \033[90m[{count_note}]\033[0m")
+        print(f"\033[1;36m{border}")
         print("\n\033[1mStep 2: Select Sessions to Migrate\033[0m")
-        print("\033[90m[Up/Down] Navigate | [Space/Enter] Toggle | [a] All | [f] Filter | [Esc/b] Back | [q] Quit\033[0m\n")
+        print(
+            "\033[90m[Up/Down] Navigate | [Space/Enter] Toggle | [a] All | [Esc/b] Back | [q] Quit\033[0m\n")
 
         # ----------------- Row 0: Back Button -----------------
         is_back_cur = (cursor_idx == BACK_IDX)
@@ -1745,12 +1721,6 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
         elif k in ('q', 'CTRL_C'):
             # Quit app
             return 'QUIT'
-        elif k == 'f':
-            # Toggle project filter
-            filter_active = not filter_active
-            scroll_offset = 0
-            cursor_idx = 1
-            continue
         elif k == 'HOME':
             cursor_idx = BACK_IDX
         elif k == 'END':

@@ -728,7 +728,7 @@ def test_select_project_screen_status_message(capsys):
     captured = capsys.readouterr()
     assert "[!] Project 'Project 1' has no sessions to migrate." in captured.out
 
-def test_select_sessions_screen_filter_not_leaking_other_projects(capsys):
+def test_select_sessions_screen_only_shows_target_project_sessions(capsys):
     sessions = [
         {"conversation_id": "c_other", "clean_title": "Other Project Session", "subagents": [], "step_count": 3, "date": "2026-11-05", "status": "New", "project_id": "p_other"}
     ]
@@ -740,9 +740,9 @@ def test_select_sessions_screen_filter_not_leaking_other_projects(capsys):
         assert res == "BACK"
 
     captured = capsys.readouterr()
-    # Filter is active by default, so 'Other Project Session' should NOT be displayed
+    # Sessions from other projects are never displayed
     assert "Other Project Session" not in captured.out
-    assert "(0 sessions)" in captured.out
+    assert "0 sessions available to migrate" in captured.out
 
 def test_run_migration_zero_sessions_after_prune_prompts_user(tmp_path, monkeypatch):
     from migrate_agy_sessions import run_migration
@@ -920,6 +920,48 @@ def test_posix_get_key_non_tty():
     with patch("sys.stdin.isatty", return_value=False):
         with patch("sys.stdin.readline", return_value=""):
             assert _posix_get_key() == "QUIT"
+
+
+def test_posix_get_key_eof():
+    from unittest.mock import MagicMock
+    mock_termios = MagicMock()
+    mock_tty = MagicMock()
+
+    with patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}), \
+         patch("sys.stdin.isatty", return_value=True), \
+         patch.object(sys.stdin, "fileno", return_value=0, create=True), \
+         patch("sys.stdin.read", return_value=""):
+        assert _posix_get_key() == "QUIT"
+
+
+def test_prune_ghost_sessions_over_1000_items(tmp_path):
+    cli_dir = tmp_path / "cli"
+    app_dir = tmp_path / "app"
+    cli_dir.mkdir()
+    app_dir.mkdir()
+    (cli_dir / "conversations").mkdir()
+    (app_dir / "conversations").mkdir()
+
+    # Generate 1200 ghost sessions
+    ghost_sessions = [
+        {
+            "conversation_id": f"ghost-{i}",
+            "title": f"Ghost {i}",
+            "app_data_dir": "antigravity",
+            "raw_summary": None,
+            "project_id": "p1"
+        }
+        for i in range(1200)
+    ]
+    _create_mock_summaries_db(cli_dir / "conversation_summaries.db", ghost_sessions)
+
+    pruned = prune_ghost_sessions(str(cli_dir), str(app_dir), project={"id": "p1"})
+    assert pruned == 1200
+
+    con = sqlite3.connect(cli_dir / "conversation_summaries.db")
+    count = con.execute("SELECT COUNT(*) FROM conversation_summaries").fetchone()[0]
+    con.close()
+    assert count == 0
 
 
 def test_posix_get_key_escape_sequences():

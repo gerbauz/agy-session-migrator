@@ -48,7 +48,6 @@ python migrate_agy_sessions.py
 - <kbd>↑</kbd> / <kbd>↓</kbd>: Move selection cursor
 - <kbd>Space</kbd> or <kbd>Enter</kbd>: Toggle checkmark on highlighted session
 - <kbd>a</kbd>: Toggle select all visible sessions
-- <kbd>f</kbd>: Toggle filter by current project / show all
 - <kbd>c</kbd>: Confirm and start migration
 - <kbd>Esc</kbd> or <kbd>b</kbd>: Return to Project Selection
 - <kbd>q</kbd>: Quit application
