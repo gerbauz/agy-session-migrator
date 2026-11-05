@@ -434,7 +434,8 @@ def prune_ghost_sessions(cli_dir, app_dir, project=None):
     try:
         con = sqlite3.connect(sum_db)
         cur = con.cursor()
-        cols = [c[1] for c in cur.execute('PRAGMA table_info(conversation_summaries)').fetchall()]
+        cols = [c[1] for c in cur.execute(
+            'PRAGMA table_info(conversation_summaries)').fetchall()]
         if not cols or 'conversation_id' not in cols or 'app_data_dir' not in cols:
             con.close()
             return 0
@@ -480,10 +481,12 @@ def prune_ghost_sessions(cli_dir, app_dir, project=None):
 
         # Execute safe deletion in batches
         placeholders = ','.join(['?'] * len(ghost_cids))
-        cur.execute(f'DELETE FROM conversation_summaries WHERE conversation_id IN ({placeholders})', ghost_cids)
+        cur.execute(
+            f'DELETE FROM conversation_summaries WHERE conversation_id IN ({placeholders})', ghost_cids)
 
         try:
-            cur.execute(f'DELETE FROM conversations_fts WHERE conversation_id IN ({placeholders})', ghost_cids)
+            cur.execute(
+                f'DELETE FROM conversations_fts WHERE conversation_id IN ({placeholders})', ghost_cids)
         except Exception:
             pass
 
@@ -1325,7 +1328,8 @@ def prompt_desktop_not_running():
             return 'QUIT'
 
 
-def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
+def select_project_screen(
+        projects, direction=TO_DESKTOP, initial_idx=1, status_message=""):
     """
     Step 1: Select target project via arrow keys and Enter.
     Row 0: < Exit Application
@@ -1393,26 +1397,36 @@ def select_project_screen(projects, direction=TO_DESKTOP, initial_idx=1):
                 f"\n  \033[90m... Showing {scroll_offset+1}-{min(scroll_offset+page_size, total)} of {total} projects ...\033[0m")
 
         print("\033[90m" + ("-" * w) + "\033[0m")
+        if status_message:
+            print(f"\033[1;33m  {status_message}\033[0m")
+        else:
+            print()
         sys.stdout.flush()
 
         k = get_key()
         if k in ('UP', 'k'):
+            status_message = ""
             cursor_idx = (cursor_idx - 1) % total_rows
         elif k in ('DOWN', 'j'):
+            status_message = ""
             cursor_idx = (cursor_idx + 1) % total_rows
         elif k == 'PAGE_UP':
+            status_message = ""
             if cursor_idx == 0:
                 cursor_idx = total_rows - 1
             else:
                 cursor_idx = max(0, cursor_idx - page_size)
         elif k == 'PAGE_DOWN':
+            status_message = ""
             if cursor_idx == total_rows - 1:
                 cursor_idx = 0
             else:
                 cursor_idx = min(total_rows - 1, cursor_idx + page_size)
         elif k == 'HOME':
+            status_message = ""
             cursor_idx = 0
         elif k == 'END':
+            status_message = ""
             cursor_idx = total_rows - 1
         elif k in ('ESC', 'q', 'CTRL_C'):
             return 'QUIT', cursor_idx
@@ -1432,10 +1446,10 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
     BACK_IDX = 0
     selected_set = set()
 
-    # Filter by project by default if there are matching sessions
+    # Filter by project by default
     matching_sessions = [
         s for s in all_sessions if is_session_for_project(s, target_project)]
-    filter_active = (len(matching_sessions) > 0)
+    filter_active = True
 
     cursor_idx = 1
     page_size = 14
@@ -1444,7 +1458,7 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
 
     while True:
         # Determine currently active session view
-        if filter_active and matching_sessions:
+        if filter_active:
             current_sessions = matching_sessions
         else:
             current_sessions = all_sessions
@@ -1464,7 +1478,15 @@ def select_sessions_screen(all_sessions, target_project, direction=TO_DESKTOP):
 
         # Header with Project & Filter Info
         if filter_active and matching_sessions:
-            filter_note = f"Matching '{target_project['name']}' only ({len(current_sessions)} sessions) - press 'f' to show all {len(all_sessions)}"
+            filter_note = (
+                f"Matching '{target_project['name']}' only "
+                f"({len(current_sessions)} sessions) - press 'f' to show all {len(all_sessions)}"
+            )
+        elif filter_active:
+            filter_note = (
+                f"Matching '{target_project['name']}' only "
+                f"(0 sessions) - press 'f' to show all {len(all_sessions)}"
+            )
         else:
             filter_note = f"Showing all {len(all_sessions)} sessions - press 'f' to filter"
 
@@ -1716,6 +1738,7 @@ def run_migration():
     target_project = None
     selected_sessions = []
     step = 1
+    project_status_msg = ""
 
     while True:
         if step == 1:
@@ -1729,9 +1752,12 @@ def run_migration():
             try:
                 hide_cursor()
                 proj_res, current_project_idx = select_project_screen(
-                    projects, initial_idx=current_project_idx)
+                    projects, initial_idx=current_project_idx,
+                    status_message=project_status_msg)
             finally:
                 show_cursor()
+
+            project_status_msg = ""
 
             if proj_res in (None, 'QUIT'):
                 print("\nMigration cancelled.")
@@ -1739,8 +1765,24 @@ def run_migration():
 
             target_project = proj_res
 
-            # Automatically prune ghost/mirrored sessions for the opened project
+            # Prune ghost/mirrored sessions for the opened project first
             prune_ghost_sessions(cli_dir, app_dir, target_project)
+
+            # Re-check session count for the selected project after pruning
+            updated_sessions = discover_sessions(
+                cli_dir, app_dir, target_project['id'])
+            matching_sessions = [
+                s for s in updated_sessions
+                if is_session_for_project(s, target_project)
+            ]
+            target_project['session_count'] = len(matching_sessions)
+
+            if len(matching_sessions) == 0:
+                project_status_msg = (
+                    f"[!] Project '{target_project['name']}' has no sessions to migrate."
+                )
+                step = 1
+                continue
 
             step = 2
             continue
